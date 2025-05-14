@@ -1,16 +1,46 @@
 package lijeur;
 
-import clojure.lang.IPersistentVector;
 import clojure.lang.Keyword;
 import clojure.lang.PersistentVector;
 
-import java.io.IOException;
 import java.io.Reader;
 import java.io.StringReader;
-import java.util.ArrayList;
-import java.util.List;
+import java.io.IOException;
+import java.util.*;
 
 public class Parser {
+
+  private static class Buffer {
+    private final char[] buf;
+    private final Reader reader;
+    private int pos = 0;
+    private int limit = 0;
+
+    Buffer(Reader reader, int size) throws IOException {
+      this.buf = new char[size];
+      this.reader = reader;
+      fill();
+    }
+
+    private void fill() throws IOException {
+      limit = reader.read(buf);
+      pos = 0;
+    }
+
+    char peek() throws IOException {
+      if (pos >= limit) fill();
+      return pos < limit ? buf[pos] : (char) -1;
+    }
+
+    char next() throws IOException {
+      if (pos >= limit) fill();
+      return pos < limit ? buf[pos++] : (char) -1;
+    }
+
+    void skipWhitespace() throws IOException {
+      while (Character.isWhitespace(peek())) next();
+    }
+  }
 
   public static Object parseEdn(String input) throws IOException {
     return parse(new Buffer(new StringReader(input), 8192));
@@ -19,84 +49,38 @@ public class Parser {
   private static Object parse(Buffer r) throws IOException {
     r.skipWhitespace();
     char c = r.peek();
+
+    if (c == (char) -1) return null;
+
     switch (c) {
-      case '[':
-        return parseVector(r);
-      case '"':
-        return parseString(r);
-      case ':':
-        return parseKeyword(r);
+      case 'n': return parseNil(r);
+      case 't':
+      case 'f': return parseBoolean(r);
+      case '"': return parseString(r);
+      case '[': return parseVector(r);
+      case '(': return parseList(r);
+      case '{': return parseMap(r);
+      case '#': return parseDispatch(r);
       default:
-        if (Character.isDigit(c) || c == '-' || c == '+') {
-          return parseNumber(r);
-        } else {
-          return parseSymbol(r);
-        }
+        if (Character.isDigit(c) || c == '-' || c == '+') return parseNumber(r);
+        return parseSymbol(r);
     }
   }
 
-  private static IPersistentVector parseVector(Buffer r) throws IOException {
-    List<Object> list = new ArrayList<>();
-    r.expect('[');
-    r.skipWhitespace();
-    while (r.peek() != ']') {
-      list.add(parse(r));
-      r.skipWhitespace();
-    }
-    r.expect(']');
-    return PersistentVector.create(list);
+  private static Object parseNil(Buffer r) throws IOException {
+    r.next(); r.next(); r.next();
+    return null;
   }
 
-  private static String parseString(Buffer r) throws IOException {
-    r.expect('"');
-    StringBuilder sb = new StringBuilder();
-    while (true) {
-      char c = r.next();
-      if (c == '"') break;
-      if (c == '\\') {
-        c = r.next();
-        switch (c) {
-          case 'n': sb.append('\n'); break;
-          case 't': sb.append('\t'); break;
-          case 'r': sb.append('\r'); break;
-          case '"': sb.append('"'); break;
-          case '\\': sb.append('\\'); break;
-          default: sb.append(c); break;
-        }
-      } else {
-        sb.append(c);
-      }
-    }
-    return sb.toString();
-  }
-
-  private static Keyword parseKeyword(Buffer r) throws IOException {
-    r.expect(':');
-    StringBuilder sb = new StringBuilder();
-    while (true) {
-      char c = r.peek();
-      if (Character.isWhitespace(c) || c == ']' || c == '}') break;
-      sb.append(r.next());
-    }
-    String s = sb.toString();
-    int slashIndex = s.indexOf('/');
-    if (slashIndex > 0 && slashIndex < s.length() - 1) {
-      String ns = s.substring(0, slashIndex);
-      String name = s.substring(slashIndex + 1);
-      return Keyword.intern(ns, name);
+  private static Boolean parseBoolean(Buffer r) throws IOException {
+    char first = r.next();
+    if (first == 't') {
+      r.next(); r.next(); r.next();
+      return true;
     } else {
-      return Keyword.intern(s);
+      r.next(); r.next(); r.next(); r.next();
+      return false;
     }
-  }
-
-  private static Object parseSymbol(Buffer r) throws IOException {
-    StringBuilder sb = new StringBuilder();
-    while (true) {
-      char c = r.peek();
-      if (Character.isWhitespace(c) || c == ']' || c == '}') break;
-      sb.append(r.next());
-    }
-    return sb.toString();
   }
 
   private static Object parseNumber(Buffer r) throws IOException {
@@ -126,7 +110,7 @@ public class Parser {
 
     if (c == '.') {
       isFloating = true;
-      r.next(); // consume '.'
+      r.next();
       c = r.peek();
       while (Character.isDigit(c)) {
         int digit = r.next() - '0';
@@ -144,49 +128,116 @@ public class Parser {
     }
   }
 
-
-  private static class Buffer {
-    private final Reader reader;
-    private final char[] buf;
-    private int pos = 0;
-    private int limit = 0;
-
-    Buffer(Reader reader, int size) {
-      this.reader = reader;
-      this.buf = new char[size];
-    }
-
-    char peek() throws IOException {
-      if (pos >= limit) {
-        limit = reader.read(buf);
-        pos = 0;
-        if (limit == -1) return (char) -1;
-      }
-      return buf[pos];
-    }
-
-    char next() throws IOException {
-      char c = peek();
-      pos++;
-      return c;
-    }
-
-    void expect(char expected) throws IOException {
-      char c = next();
-      if (c != expected) {
-        throw new RuntimeException("Expected '" + expected + "', got '" + c + "'");
-      }
-    }
-
-    void skipWhitespace() throws IOException {
-      while (true) {
-        char c = peek();
-        if (Character.isWhitespace(c)) {
-          pos++;
-        } else {
-          break;
+  private static String parseString(Buffer r) throws IOException {
+    r.next();
+    StringBuilder sb = new StringBuilder();
+    while (true) {
+      char c = r.next();
+      if (c == (char) -1) throw new RuntimeException("EOF in string");
+      if (c == '"') return sb.toString();
+      if (c == '\\') {
+        char esc = r.next();
+        switch (esc) {
+          case 'n': sb.append('\n'); break;
+          case 't': sb.append('\t'); break;
+          case 'r': sb.append('\r'); break;
+          case '"': sb.append('"'); break;
+          case '\\': sb.append('\\'); break;
+          default: sb.append(esc);
         }
+      } else {
+        sb.append(c);
       }
     }
+  }
+
+  private static Object parseSymbol(Buffer r) throws IOException {
+    char c = r.peek();
+    int start = r.pos;
+    while (!Character.isWhitespace(c) && "()[]{}".indexOf(c) == -1 && c != (char) -1) {
+      r.next();
+      c = r.peek();
+    }
+    String s = new String(r.buf, start, r.pos - start);
+    if (s.startsWith(":")) return Keyword.intern(null, s.substring(1));
+    switch (s) {
+      case "nil": return null;
+      case "true": return true;
+      case "false": return false;
+      default: return s;
+    }
+  }
+
+  private static PersistentVector parseVector(Buffer r) throws IOException {
+    r.next();
+    ArrayList<Object> items = new ArrayList<>();
+    while (true) {
+      r.skipWhitespace();
+      char c = r.peek();
+      if (c == ']') {
+        r.next();
+        return PersistentVector.create(items);
+      }
+      items.add(parse(r));
+    }
+  }
+
+  private static List<Object> parseList(Buffer r) throws IOException {
+    r.next();
+    List<Object> list = new ArrayList<>();
+    while (true) {
+      r.skipWhitespace();
+      char c = r.peek();
+      if (c == ')') {
+        r.next();
+        return list;
+      }
+      list.add(parse(r));
+    }
+  }
+
+  private static Map<Object, Object> parseMap(Buffer r) throws IOException {
+    r.next();
+    Map<Object, Object> map = new HashMap<>();
+    while (true) {
+      r.skipWhitespace();
+      char c = r.peek();
+      if (c == '}') {
+        r.next();
+        return map;
+      }
+      Object k = parse(r);
+      r.skipWhitespace();
+      Object v = parse(r);
+      map.put(k, v);
+    }
+  }
+
+  private static Set<Object> parseSet(Buffer r) throws IOException {
+    r.next();
+    if (r.next() != '{') throw new RuntimeException("Expected set literal");
+    Set<Object> set = new HashSet<>();
+    while (true) {
+      r.skipWhitespace();
+      char c = r.peek();
+      if (c == '}') {
+        r.next();
+        return set;
+      }
+      set.add(parse(r));
+    }
+  }
+
+  private static Object parseDispatch(Buffer r) throws IOException {
+    r.next();
+    char tag = r.peek();
+    if (tag == '{') return parseSet(r);
+    StringBuilder tagBuf = new StringBuilder();
+    while (!Character.isWhitespace(tag) && tag != (char) -1) {
+      tagBuf.append(r.next());
+      tag = r.peek();
+    }
+    Object value = parse(r);
+    return Map.of("tag", tagBuf.toString(), "value", value);
   }
 }
