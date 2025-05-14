@@ -96,31 +96,54 @@ public class Parser {
       if (Character.isWhitespace(c) || c == ']' || c == '}') break;
       sb.append(r.next());
     }
-    String s = sb.toString();
-    return s;
+    return sb.toString();
   }
 
-  private static Number parseNumber(Buffer r) throws IOException {
-    StringBuilder sb = new StringBuilder();
-    while (true) {
-      char c = r.peek();
-      if (Character.isDigit(c) || c == '.' || c == '-' || c == '+') {
-        sb.append(r.next());
-      } else {
-        break;
-      }
+  private static Object parseNumber(Buffer r) throws IOException {
+    boolean isNegative = false;
+    boolean isFloating = false;
+    long value = 0;
+    double dvalue = 0.0;
+    int scale = 0;
+
+    char c = r.peek();
+    if (c == '-') {
+      isNegative = true;
+      r.next();
+      c = r.peek();
+    } else if (c == '+') {
+      r.next();
+      c = r.peek();
     }
-    String s = sb.toString();
-    try {
-      if (s.contains(".")) {
-        return Double.parseDouble(s);
-      } else {
-        return Long.parseLong(s);
+
+    while (Character.isDigit(c)) {
+      int digit = r.next() - '0';
+      value = value * 10 + digit;
+      dvalue = dvalue * 10 + digit;
+      if (isFloating) scale++;
+      c = r.peek();
+    }
+
+    if (c == '.') {
+      isFloating = true;
+      r.next(); // consume '.'
+      c = r.peek();
+      while (Character.isDigit(c)) {
+        int digit = r.next() - '0';
+        dvalue = dvalue * 10 + digit;
+        scale++;
+        c = r.peek();
       }
-    } catch (NumberFormatException e) {
-      throw new RuntimeException("Invalid number: " + s);
+      dvalue = dvalue / Math.pow(10, scale);
+    }
+
+    if (isFloating) {
+      return isNegative ? -dvalue : dvalue;
+    } else {
+      return isNegative ? -value : value;
     }
   }
+
 
   private static class Buffer {
     private final Reader reader;
