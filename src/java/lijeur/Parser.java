@@ -2,6 +2,12 @@ package lijeur;
 
 import clojure.lang.Keyword;
 import clojure.lang.PersistentVector;
+import clojure.lang.PersistentList;
+import clojure.lang.PersistentHashMap;
+import clojure.lang.PersistentHashSet;
+import clojure.lang.IPersistentList;
+import clojure.lang.IPersistentMap;
+import clojure.lang.IPersistentSet;
 
 import java.io.Reader;
 import java.io.StringReader;
@@ -131,6 +137,7 @@ public class Parser {
   private static String parseString(Buffer r) throws IOException {
     r.next();
     StringBuilder sb = new StringBuilder();
+
     while (true) {
       char c = r.next();
       if (c == (char) -1) throw new RuntimeException("EOF in string");
@@ -170,7 +177,7 @@ public class Parser {
 
   private static PersistentVector parseVector(Buffer r) throws IOException {
     r.next();
-    ArrayList<Object> items = new ArrayList<>();
+    List<Object> items = new ArrayList<>();
     while (true) {
       r.skipWhitespace();
       char c = r.peek();
@@ -182,7 +189,7 @@ public class Parser {
     }
   }
 
-  private static List<Object> parseList(Buffer r) throws IOException {
+  private static IPersistentList parseList(Buffer r) throws IOException {
     r.next();
     List<Object> list = new ArrayList<>();
     while (true) {
@@ -190,13 +197,13 @@ public class Parser {
       char c = r.peek();
       if (c == ')') {
         r.next();
-        return list;
+        return PersistentList.create(list);
       }
       list.add(parse(r));
     }
   }
 
-  private static Map<Object, Object> parseMap(Buffer r) throws IOException {
+  private static IPersistentMap parseMap(Buffer r) throws IOException {
     r.next();
     Map<Object, Object> map = new HashMap<>();
     while (true) {
@@ -204,7 +211,7 @@ public class Parser {
       char c = r.peek();
       if (c == '}') {
         r.next();
-        return map;
+        return PersistentHashMap.create(map);
       }
       Object k = parse(r);
       r.skipWhitespace();
@@ -213,7 +220,7 @@ public class Parser {
     }
   }
 
-  private static Set<Object> parseSet(Buffer r) throws IOException {
+  private static IPersistentSet parseSet(Buffer r) throws IOException {
     r.next();
     if (r.next() != '{') throw new RuntimeException("Expected set literal");
     Set<Object> set = new HashSet<>();
@@ -222,7 +229,7 @@ public class Parser {
       char c = r.peek();
       if (c == '}') {
         r.next();
-        return set;
+        return PersistentHashSet.create(set);
       }
       set.add(parse(r));
     }
