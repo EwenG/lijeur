@@ -2,46 +2,93 @@ package lijeur;
 
 import java.io.IOException;
 import java.io.Reader;
+import java.util.Arrays;
 
 public class Buffer {
-  // There should be 2 fields for chunks (char arrays)
+  private final Reader reader;
+  int bufferSize;
+  final int readChunkSize;
+  boolean EOF = false;
 
-  // There should be fields to keep track of the current chunk and the current position in the current chunk.
+  char[] buffer;
 
-  // There should be fields to keep track of the start position of the current token being read
+  // Current reading position in the buffer
+  private int pos = 0;
+  // Max reading position in the buffer
+  private int posEnd = 0;
+  // Position of the start of current token in the buffer
+  private int tokenStart = 0;
 
-  // There should be a char array of reasonable size (maybe 256). This field should be returned by getToken()
-  // when the token fits in this char array. Otherwise, if the token is to big, getToken() should allocate a new array.
-
-
-  Buffer(Reader reader, int size) throws IOException {
+  public Buffer(Reader reader, int readChunkSize) {
+    this.reader = reader;
+    this.readChunkSize = readChunkSize;
+    this.bufferSize = 2 * readChunkSize;
+    buffer = new char[bufferSize];
   }
 
-  // Should read one char and return it
-  // Should load the current chunk if needed, by reading the reader.
-  // If the current chunk is full, it should load the other chunk
-  // If both chunks are full, the current chunk should be extended
-  char read() throws IOException {
-
+  public int read() throws IOException {
+    if (posEnd == 0) {
+      posEnd = reader.read(buffer, 0, readChunkSize);
+      if(posEnd <= 0) {
+        EOF = true;
+        return -1;
+      }
+    }
+    if(pos == posEnd && (bufferSize - pos) >= readChunkSize) {
+      int readLength = reader.read(buffer, pos, readChunkSize);
+      if(readLength <= 0) {
+        EOF = true;
+        return -1;
+      } else {
+        posEnd = posEnd + readLength;
+      }
+    } else if (pos == posEnd && (bufferSize - pos) < readChunkSize) {
+      buffer = Arrays.copyOf(buffer, bufferSize + readChunkSize);
+      bufferSize = bufferSize + readChunkSize;
+      int readLength = reader.read(buffer, pos, readChunkSize);
+      if(readLength <= 0) {
+        EOF = true;
+        return -1;
+      } else {
+        posEnd = posEnd + readLength;
+      }
+    }
+    EOF = false;
+    return buffer[pos++];
   }
 
-  // Should set the position one step back
-  char unread() throws IOException {
-
+  public void unread() {
+    if(pos > tokenStart && !EOF) {
+      pos--;
+    }
   }
 
-  // Should mark the end of the current token, next calls to read() should read a new token
-  char mark() {
-
+  public char[] getToken() {
+    return buffer;
   }
 
-  // Should be called only after mark(), should return the marked token
-  char getToken() {
-
+  public int getTokenStart() {
+    return tokenStart;
   }
 
-  // Should return length of the token returned by getToken()
-  long getTokenLength() {
+  public int getTokenEnd() {
+    return pos;
+  }
 
+  public String getTokenString() {
+    return new String(getToken(), getTokenStart(), getTokenEnd() - getTokenStart());
+  }
+
+  public void startNewToken() {
+    if(pos > readChunkSize) {
+      System.arraycopy(buffer, pos, buffer, 0, posEnd - pos);
+      posEnd = posEnd - pos;
+      pos = 0;
+      if(bufferSize > 2 * readChunkSize && posEnd < readChunkSize) {
+        buffer = Arrays.copyOf(buffer, 2 * readChunkSize);
+        bufferSize = 2 * readChunkSize;
+      }
+    }
+    tokenStart = pos;
   }
 }
