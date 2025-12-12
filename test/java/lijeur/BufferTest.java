@@ -108,4 +108,31 @@ public class BufferTest {
     assertEquals(-1, buffer.read()); // EOF
     assertTrue(buffer.EOF); // public for test access
   }
+
+  @Test
+  public void testLineColumns() throws IOException {
+    Buffer buffer = new Buffer(new StringReader("abc\nde"), 2, true);
+
+    assertEquals(0, buffer.getLine());
+    assertEquals(0, buffer.getColumn());
+    buffer.read();
+    assertEquals(0, buffer.getLine());
+    assertEquals(1, buffer.getColumn());
+    buffer.read();
+    assertEquals(0, buffer.getLine());
+    assertEquals(2, buffer.getColumn());
+    buffer.read();
+    assertEquals(0, buffer.getLine());
+    assertEquals(3, buffer.getColumn());
+    buffer.read();
+    assertEquals(1, buffer.getLine());
+    assertEquals(0, buffer.getColumn());
+    buffer.read();
+    assertEquals(1, buffer.getLine());
+    assertEquals(1, buffer.getColumn());
+    buffer.read();
+    assertEquals(1, buffer.getLine());
+    assertEquals(2, buffer.getColumn());
+    assertEquals(-1, buffer.read());
+  }
 }

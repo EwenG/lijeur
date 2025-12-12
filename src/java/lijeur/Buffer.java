@@ -9,6 +9,10 @@ public class Buffer {
   int bufferSize;
   final int readChunkSize;
   boolean EOF = false;
+  private int lineColumnPos;
+  private int line = 0;
+  private int column= 0;
+  private boolean skipLF = false;
 
   char[] buffer;
 
@@ -19,11 +23,20 @@ public class Buffer {
   // Position of the start of current token in the buffer
   private int tokenStart = 0;
 
-  public Buffer(Reader reader, int readChunkSize) {
+  public Buffer(Reader reader, int readChunkSize, boolean countLines) {
     this.reader = reader;
     this.readChunkSize = readChunkSize;
     this.bufferSize = 2 * readChunkSize;
     buffer = new char[bufferSize];
+    if(countLines) {
+      this.lineColumnPos = 0;
+    } else {
+      this.lineColumnPos = -1;
+    }
+  }
+
+  public Buffer(Reader reader, int readChunkSize) {
+    this(reader, readChunkSize, false);
   }
 
   public int read() throws IOException {
@@ -81,6 +94,7 @@ public class Buffer {
 
   public void startNewToken() {
     if(pos > readChunkSize) {
+      updateLineColumn();
       System.arraycopy(buffer, pos, buffer, 0, posEnd - pos);
       posEnd = posEnd - pos;
       pos = 0;
@@ -90,5 +104,40 @@ public class Buffer {
       }
     }
     tokenStart = pos;
+  }
+
+  public void updateLineColumn() {
+    if(lineColumnPos > -1) {
+      for (int i = lineColumnPos; i < pos; ++i) {
+        int ch = buffer[i];
+        if (skipLF && ch == '\n') {
+          skipLF = false;
+          continue;
+        }
+        if (ch == '\r') {
+          skipLF = true;
+          line = line + 1;
+          column = 0;
+        } else if (ch == '\n') {
+          skipLF = false;
+          line = line + 1;
+          column = 0;
+        } else {
+          skipLF = false;
+          column = column + 1;
+        }
+      }
+      lineColumnPos = pos;
+    }
+  }
+
+  public int getLine() {
+    updateLineColumn();
+    return line;
+  }
+
+  public int getColumn() {
+    updateLineColumn();
+    return column;
   }
 }
