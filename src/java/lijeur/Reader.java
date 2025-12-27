@@ -9,9 +9,10 @@ import java.util.*;
 
 public class Reader {
 
-  private Buffer buffer;
+  private final Buffer buffer;
 
   public static final BitSet macroMask = new BitSet(0x80);
+  public static final int DEFAULT_READ_CHUNK_SIZE = 4096;
   // A safe upper bound in base 10 (so also in base 8)
   // ie the result of the equation: val * 10 + 9 <= Long.MAX_VALUE
   public static final long LONG_LIMIT = (Long.MAX_VALUE - 9) / 10;
@@ -20,7 +21,6 @@ public class Reader {
 
   private final boolean throwOnEOF;
   private final Object eofValue;
-  private final boolean countLines;
 
   static {
     macroMask.set('"');
@@ -46,11 +46,24 @@ public class Reader {
     this.buffer = new Buffer(r, readChunkSize, countLines);
     this.throwOnEOF = throwOnEOF;
     this.eofValue = eofValue;
-    this.countLines = countLines;
+  }
+
+  public Reader(java.io.Reader r, boolean throwOnEOF, Object eofValue, boolean countLines) {
+    this.buffer = new Buffer(r, DEFAULT_READ_CHUNK_SIZE, countLines);
+    this.throwOnEOF = throwOnEOF;
+    this.eofValue = eofValue;
+  }
+
+  public Reader(java.io.Reader r, boolean throwOnEOF, Object eofValue) {
+    this(r, throwOnEOF, eofValue, false);
+  }
+
+  public Reader(java.io.Reader r, boolean throwOnEOF) {
+    this(r, throwOnEOF, null, false);
   }
 
   public Reader(java.io.Reader r) {
-    this(r, 4096, true, null, false);
+    this(r, true, null, false);
   }
 
   public static boolean isWhitespace(int ch) {
@@ -80,7 +93,7 @@ public class Reader {
       int ch = buffer.read();
       if (isWhitespace(ch) || isMacro(ch) || ch == -1) {
         buffer.unread();
-        throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+        throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
       }
     }
   }
@@ -135,7 +148,7 @@ public class Reader {
     } else {
       readInvalidNumber();
     }
-    throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+    throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
   }
 
   public Number readNumberBigInt(boolean isOctal) throws IOException {
@@ -152,7 +165,7 @@ public class Reader {
     } else {
       readInvalidNumber();
     }
-    throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+    throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
   }
 
   public Number readNumberBigIntRadix() throws IOException {
@@ -165,7 +178,7 @@ public class Reader {
     } else {
       readInvalidNumber();
     }
-    throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+    throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
   }
 
   public Number readNumberOverflow(boolean isOctal, boolean isFloatingPoint) throws IOException {
@@ -201,7 +214,7 @@ public class Reader {
         } else if(isValidOctal) {
           return readNumberBigInt(true);
         } else {
-          throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+          throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
         }
       } else if(ch == 'M') {
         return readNumberBigDecimal();
@@ -226,7 +239,7 @@ public class Reader {
             return BigInt.fromBigInteger(bi);
           }
         } else {
-          throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+          throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
         }
       } else {
         readInvalidNumber();
@@ -311,7 +324,7 @@ public class Reader {
     } else {
       readInvalidNumber();
     }
-    throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+    throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
   }
 
   public Number readNumberRadixCh1(boolean negative, int ch1) throws IOException {
@@ -320,7 +333,7 @@ public class Reader {
     } else {
       readInvalidNumber();
     }
-    throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+    throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
   }
 
   public Number readNumberRadixCh2(boolean negative, int ch1, int ch2) throws IOException {
@@ -329,7 +342,7 @@ public class Reader {
     } else {
       readInvalidNumber();
     }
-    throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+    throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
   }
 
   public Number readNumberFloatingPoint(boolean negative, long val) throws IOException {
@@ -385,7 +398,7 @@ public class Reader {
         if(isValidOctal) {
           return readNumberBigInt(true);
         } else {
-          throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+          throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
         }
       } else if (ch == 'M') {
         return readNumberBigDecimal();
@@ -397,7 +410,7 @@ public class Reader {
             return val8;
           }
         } else {
-          throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+          throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
         }
       } else {
         readInvalidNumber();
@@ -469,7 +482,7 @@ public class Reader {
         }
       }
     }
-    throw new RuntimeException("Invalid number: " + buffer.getTokenString());
+    throw new ReaderException("Invalid number: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
   }
 
   public boolean isNumberLiteral(int initch) throws IOException {
@@ -493,7 +506,7 @@ public class Reader {
       int ch = buffer.read();
       if (isWhitespace(ch) || isMacro(ch) || ch == -1) {
         buffer.unread();
-        throw new RuntimeException("Invalid symbol: " + buffer.getTokenString());
+        throw new ReaderException("Invalid symbol: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
       }
     }
   }
@@ -509,9 +522,9 @@ public class Reader {
         if(buffer.getTokenStart() == slashIndex && slashIndex == buffer.getTokenEnd() - 1) {
           return Symbol.intern(null, "/");
         } else if(buffer.getTokenStart() == slashIndex) {
-          throw new RuntimeException("Invalid symbol: " + buffer.getTokenString());
+          throw new ReaderException("Invalid symbol: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
         } else if (slashIndex == buffer.getTokenEnd() - 1) {
-          throw new RuntimeException("Invalid symbol: " + buffer.getTokenString());
+          throw new ReaderException("Invalid symbol: " + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
         } else {
           String nsString = new String(bufferToken, buffer.getTokenStart(), slashIndex - buffer.getTokenStart());
           String nameString = new String(bufferToken, slashIndex + 1, buffer.getTokenEnd() - (slashIndex + 1));
@@ -528,14 +541,171 @@ public class Reader {
         return readSymbolNamespaced(buffer.getTokenEnd() - 1);
       } else if (isWhitespace(ch) || isMacro(ch) || ch == -1) {
         buffer.unread();
-        if(buffer.getTokenString().equals("nil")) {
+        String tokenString = buffer.getTokenString();
+        if(tokenString.equals("nil")) {
           return null;
-        } else if(buffer.getTokenString().equals("true")) {
+        } else if(tokenString.equals("true")) {
           return Boolean.TRUE;
-        } else if(buffer.getTokenString().equals("false")) {
+        } else if(tokenString.equals("false")) {
           return Boolean.FALSE;
         }
-        return Symbol.intern(null, buffer.getTokenString());
+        return Symbol.intern(null, tokenString);
+      }
+    }
+  }
+
+  private byte digit16(int ch) {
+    if ('0' <= ch && ch <= '9') {
+      return (byte) (ch - '0');
+    } else if ('a' <= ch && ch <= 'f') {
+      return (byte) (ch - 'a' + 10);
+    } else if ('A' <= ch && ch <= 'F') {
+      return (byte) (ch - 'A' + 10);
+    } else {
+      throw new ReaderException("Invalid digit: " + ((char) ch), null, buffer.getLine(), buffer.getColumn());
+    }
+  }
+
+  private char readUnicodeChar() throws IOException {
+    int ch1 = buffer.read();
+    if(ch1 == '"') {
+      throw new ReaderException("Invalid unicode escape: \\u", null, buffer.getLine(), buffer.getColumn());
+    } else if (ch1 == -1) {
+      throw new ReaderException("EOF while reading", null, buffer.getLine(), buffer.getColumn());
+    }
+    int ch2 = buffer.read();
+    if(ch2 == '"') {
+      throw new ReaderException("Invalid unicode escape: \\u" + (char)ch1, null, buffer.getLine(), buffer.getColumn());
+    } else if (ch2 == -1) {
+      throw new ReaderException("EOF while reading", null, buffer.getLine(), buffer.getColumn());
+    }
+    int ch3 = buffer.read();
+    if(ch3 == '"') {
+      throw new ReaderException("Invalid unicode escape: \\u" + (char)ch1 + (char)ch2, null, buffer.getLine(), buffer.getColumn());
+    } else if (ch3 == -1) {
+      throw new ReaderException("EOF while reading", null, buffer.getLine(), buffer.getColumn());
+    }
+    int ch4 = buffer.read();
+    if(ch4 == '"') {
+      throw new ReaderException("Invalid unicode escape: \\u" + (char)ch1 + (char)ch2 + (char)ch3, null, buffer.getLine(), buffer.getColumn());
+    } else if (ch4 == -1) {
+      throw new ReaderException("EOF while reading", null, buffer.getLine(), buffer.getColumn());
+    }
+    int ch = (digit16(ch1) << 12)
+        + (digit16(ch2) << 8)
+        + (digit16(ch3) << 4)
+        +  digit16(ch4);
+    return (char) ch;
+  }
+
+  private char readOctalChar() throws IOException {
+    int value = 0;
+    for (int i = 0; i < 3; ++i) {
+      int ch = buffer.read();
+      if (ch >= '0' && ch <= '7') {
+        value = (value << 3) + (ch - '0');
+      } else {
+        buffer.unread();
+        break;
+      }
+    }
+    if (value > 0377) {
+      throw new ReaderException("Octal escape sequence must be in range [0, 377], got: " + Integer.toString(value, 8), null, buffer.getLine(), buffer.getColumn());
+    }
+    return (char) value;
+  }
+
+  public Object readString() throws IOException {
+    while (true) {
+      int ch = buffer.read();
+      if (ch == '"') {
+        return new String(buffer.getToken(), buffer.getTokenStart() + 1, buffer.getTokenEnd() - 2 - buffer.getTokenStart());
+      } else if (ch == -1) {
+        throw new ReaderException("EOF while reading string", null, buffer.getLine(), buffer.getColumn());
+      } else if (ch == '\\') {
+        int ch2 = buffer.read();
+        if (ch2 == '"') {
+          buffer.replace(2, '"');
+        } else if (ch2 == '\\') {
+          buffer.replace(2,'\\');
+        } else if (ch2 == 'n') {
+          buffer.replace(2,'\n');
+        } else if (ch2 == 'r') {
+          buffer.replace(2,'\r');
+        } else if (ch2 == 'u') {
+          char unicodeChar = readUnicodeChar();
+          buffer.replace(6, unicodeChar);
+        } else if (ch2 == 't') {
+          buffer.replace(2,'\t');
+        } else if (ch2 >= '0' && ch2 <= '7') {
+          buffer.unread();
+          int replacePos = buffer.getTokenEnd() - 1;
+          char octalChar = readOctalChar();
+          int replaceLength = buffer.getTokenEnd() - replacePos;
+          buffer.replace(replaceLength, octalChar);
+        } else if (ch2 == 'b') {
+          buffer.replace(2,'\b');
+        } else if (ch2 == 'f') {
+          buffer.replace(2,'\f');
+        } else if (ch2 == -1) {
+          throw new ReaderException("EOF while reading string", null, buffer.getLine(), buffer.getColumn());
+        }
+      }
+    }
+  }
+
+  private boolean compareNext(int ch, String s) throws IOException {
+    if ((char) ch != s.charAt(0)) {
+      return false;
+    }
+
+    for (int i = 1; i < s.length(); ++i) {
+      ch = buffer.read();
+      if (ch == -1) {
+        throw new ReaderException("EOF while reading", null, buffer.getLine(), buffer.getColumn());
+      }
+      if ((char) ch != s.charAt(i)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  public Object readCharacter() throws IOException {
+    int ch = buffer.read();
+    if(ch == -1) {
+      throw new ReaderException("EOF while reading character", null, buffer.getLine(), buffer.getColumn());
+    }
+    int peek = buffer.read();
+    buffer.unread();
+
+    if (isWhitespace(peek) || isMacro(peek) || peek == -1) {
+      return (char) ch;
+    }
+
+    if (ch == 'u') {
+      return readUnicodeChar();
+    } else if (ch == 'o') {
+      return readOctalChar();
+    } else if (compareNext(ch, "newline")) {
+      return '\n';
+    } else if (compareNext(ch, "return")) {
+      return '\r';
+    } else if (compareNext(ch, "space")) {
+      return ' ';
+    } else if (compareNext(ch, "tab")) {
+      return '\t';
+    } else if (compareNext(ch, "backspace")) {
+      return '\b';
+    } else if (compareNext(ch, "formfeed")) {
+      return '\f';
+    }
+
+    while (true) {
+      int chx = buffer.read();
+      if (isWhitespace(chx) || isMacro(chx) || chx == -1) {
+        buffer.unread();
+        throw new ReaderException("Invalid character: \\" + buffer.getTokenString(), null, buffer.getLine(), buffer.getColumn());
       }
     }
   }
@@ -546,12 +716,28 @@ public class Reader {
     int ch1 = buffer.read();
 
     if (ch1 == -1) {
-      return null;
+      if(throwOnEOF) {
+        throw new ReaderException("EOF while reading", null, buffer.getLine(), buffer.getColumn());
+      } else {
+        return eofValue;
+      }
+    } else if(ch1 == '"') {
+      return readString();
     } else if(ch1 == '-') {
       int ch2 = buffer.read();
       buffer.unread();
       if(isDigit(ch2)) {
         return readNumberNegative();
+      } else {
+        return readSymbol();
+      }
+    } else if(ch1 == '\\') {
+      return readCharacter();
+    } else if(ch1 == '+') {
+      int ch2 = buffer.read();
+      buffer.unread();
+      if(isDigit(ch2)) {
+        return readNumber(false);
       } else {
         return readSymbol();
       }

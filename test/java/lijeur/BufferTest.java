@@ -106,6 +106,7 @@ public class BufferTest {
     Buffer buffer = new Buffer(new StringReader("x"), 1);
     assertEquals('x', buffer.read());
     assertEquals(-1, buffer.read()); // EOF
+    assertEquals(-1, buffer.read()); // Keep returning EOF
     assertTrue(buffer.EOF); // public for test access
   }
 

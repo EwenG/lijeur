@@ -10,8 +10,8 @@ public class Buffer {
   final int readChunkSize;
   boolean EOF = false;
   private int lineColumnPos;
-  private int line = 0;
-  private int column= 0;
+  private int line;
+  private int column;
   private boolean skipLF = false;
 
   char[] buffer;
@@ -30,8 +30,12 @@ public class Buffer {
     buffer = new char[bufferSize];
     if(countLines) {
       this.lineColumnPos = 0;
+      this.line = 0;
+      this.column = 0;
     } else {
       this.lineColumnPos = -1;
+      this.line = -1;
+      this.column = -1;
     }
   }
 
@@ -40,6 +44,9 @@ public class Buffer {
   }
 
   public int read() throws IOException {
+    if(EOF) {
+      return -1;
+    }
     if (posEnd == 0) {
       posEnd = reader.read(buffer, 0, readChunkSize);
       if(posEnd <= 0) {
@@ -66,13 +73,21 @@ public class Buffer {
         posEnd = posEnd + readLength;
       }
     }
-    EOF = false;
     return buffer[pos++];
   }
 
   public void unread() {
     if(pos > tokenStart && !EOF) {
       pos--;
+    }
+  }
+
+  public void replace(int replaceLength, char ch) {
+    int replacePos = pos - replaceLength;
+    if(replacePos >= tokenStart && !EOF) {
+      buffer[replacePos] = ch;
+      System.arraycopy(buffer, pos, buffer, replacePos + 1, posEnd - (replacePos + 1));
+      pos = pos - (replaceLength - 1);
     }
   }
 
