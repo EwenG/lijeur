@@ -58,8 +58,15 @@ public class Reader2NumberTest {
       }
       assertEquals(expected.getClass(), actual.getClass(),
           "type mismatch for \"" + input + "\" (chunk=" + chunk + ")");
-      assertEquals(expected, actual,
-          "value mismatch for \"" + input + "\" (chunk=" + chunk + ")");
+      if (expected instanceof java.util.regex.Pattern)   // Pattern has no value equals
+        assertEquals(((java.util.regex.Pattern) expected).pattern(),
+            ((java.util.regex.Pattern) actual).pattern(),
+            "regex mismatch for \"" + input + "\" (chunk=" + chunk + ")");
+      else
+        assertEquals(expected, actual,
+            "value mismatch for \"" + input + "\" (chunk=" + chunk + ")");
+      assertEquals(clojure.lang.RT.meta(expected), clojure.lang.RT.meta(actual),
+          "metadata mismatch for \"" + input + "\" (chunk=" + chunk + ")");
     }
   }
 
@@ -329,6 +336,66 @@ public class Reader2NumberTest {
   public void testDiscard() {
     assertAllMatchClojure("#_ 1 2", "(1 #_2 3)", "[#_#_1 2 3]", "#_(1 2) 99",
         "{:a #_:skip 1}", "#_#_1 2 3", "(#_1)", "[1 #_ ; c\n 2 3]");
+  }
+
+  @Test
+  public void testQuoteDerefVar() {
+    assertAllMatchClojure("'x", "'(1 2 3)", "'foo/bar", "''x", "'nil",
+        "@x", "@(atom 1)", "@@x", "#'x", "#'foo/bar", "#'clojure.core/map",
+        "(quote x)", "['a @b #'c]");
+  }
+
+  @Test
+  public void testUnquote() {
+    assertAllMatchClojure("~x", "~@x", "~(a b)", "~@(1 2 3)", "[~a ~@b]");
+  }
+
+  @Test
+  public void testSymbolicValues() {
+    assertAllMatchClojure("##Inf", "##-Inf", "##NaN", "## Inf", "##Foo", "##", "##1",
+        "[##Inf ##-Inf ##NaN]");
+  }
+
+  @Test
+  public void testMetadata() {
+    assertAllMatchClojure("^:m x", "^{:a 1} x", "^String x", "^\"tag\" x", "^:a ^:b x",
+        "^{:a 1 :b 2} (1 2)", "^:kw [1 2]", "^sym {:x 1}", "^:m 5", "^:m :kw");
+  }
+
+  @Test
+  public void testRegex() {
+    // Note: Pattern has no value equals, so patterns are only comparable at top level here.
+    assertAllMatchClojure("#\"a.*b\"", "#\"\\d+\"", "#\"\"", "#\"[a-z]+\"",
+        "#\"a\\\"b\"", "#\"\\s*\\w+\"", "#\"unterminated");
+  }
+
+  @Test
+  public void testTaggedLiterals() {
+    assertAllMatchClojure("#inst \"2020-01-01\"", "#inst \"2020-01-01T12:34:56\"",
+        "#uuid \"550e8400-e29b-41d4-a716-446655440000\"",
+        "#foo/bar 42", "#unknown 1", "#inst \"not-a-date\"", "#uuid \"bad\"",
+        "(1 #inst \"2020-01-01\" 2)");
+  }
+
+  @Test
+  public void testNamespacedMaps() {
+    assertAllMatchClojure(
+        "#:ns{:a 1 :b 2}", "#:ns{:a 1}", "#::{:x 1}", "#:person{:name \"a\" :age 30}",
+        "#:ns{}", "#::{}", "#:ns {:a 1}", "#::  {:x 1}", "#:clojure.core{:a 1}", "#:a.b.c{:x 1}",
+        // key rewriting rules
+        "#:ns{:other/k 1}", "#:ns{:_/k 1}", "#:ns{sym 1}", "#:ns{:a/b 1}", "#:ns{1 2}",
+        "#:ns{\"s\" 1}", "#:ns{:_/k 1 :a 2}",
+        // nested
+        "(1 #:ns{:a 1} 2)", "[#:x{:y 1}]", "#:outer{:a #:inner{:b 1}}",
+        // errors
+        "#:{}", "#::", "#:ns", "#:ns 5", "#:ns[1 2]", "#: ns {:a 1}", "#:ns/x{:a 1}",
+        "#:5{:a 1}", "#::nope{:a 1}", "#:ns{:a 1 :a 2}", "#:ns{:a}");
+  }
+
+  @Test
+  public void testDispatchErrors() {
+    assertAllMatchClojure("#<x>", "#<unreadable>", "#?(:clj 1 :cljs 2)", "#?@(:clj [1])",
+        "#$", "# ");
   }
 
   @Test

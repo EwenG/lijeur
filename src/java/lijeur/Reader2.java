@@ -1,6 +1,14 @@
 package lijeur;
 
 import clojure.lang.BigInt;
+import clojure.lang.IFn;
+import clojure.lang.IMapEntry;
+import clojure.lang.IMeta;
+import clojure.lang.IObj;
+import clojure.lang.IPersistentMap;
+import clojure.lang.IPersistentVector;
+import clojure.lang.IReference;
+import clojure.lang.ISeq;
 import clojure.lang.Keyword;
 import clojure.lang.LazilyPersistentVector;
 import clojure.lang.Namespace;
@@ -24,9 +32,12 @@ import java.util.regex.Pattern;
  * <p>Scope so far: numbers, symbols, keywords, strings, characters, the literals
  * {@code nil} / {@code true} / {@code false}, collections ({@code (...)}, {@code [...]},
  * {@code {...}}, {@code #{...}}), and comments ({@code ;}, {@code #!}, {@code #_}).
- * {@link #read()} skips leading whitespace and reads a single form; a form starting with a
- * not-yet-supported reader macro (e.g. {@code '}, {@code @}, {@code #"}) throws
- * {@link UnsupportedOperationException}.
+ * quote ({@code '}), deref ({@code @}), var ({@code #'}), unquote ({@code ~}/{@code ~@}),
+ * metadata ({@code ^}), symbolic values ({@code ##Inf}/{@code ##-Inf}/{@code ##NaN}),
+ * regex ({@code #"..."}), tagged literals ({@code #inst}/{@code #uuid}/data readers), and
+ * namespaced maps ({@code #:ns{...}} / {@code #::{...}}). {@link #read()} skips leading
+ * whitespace and reads a single form; a not-yet-supported macro (syntax-quote {@code `},
+ * anonymous fn {@code #(}, {@code #=}) throws {@link UnsupportedOperationException}.
  *
  * <p>Tokens are scanned directly over the {@link Buffer} backing array (no per-character
  * method dispatch). The common number case — a plain decimal {@code long} — plus hex,
@@ -91,6 +102,13 @@ public class Reader2 {
           throw new RuntimeException("Unmatched delimiter: " + (char) c1);
         case ';':  buffer.read(); skipLine(); continue;         // line comment
         case '#':  { Object o = readDispatch(); if (o == SKIP) continue; return o; }
+        case '\'': buffer.read(); return RT.list(QUOTE, readForm());              // 'x
+        case '@':  buffer.read(); return RT.list(DEREF, readForm());             // @x
+        case '~':  buffer.read(); return readUnquote();                          // ~x / ~@x
+        case '^':  buffer.read(); return readMeta();                             // ^meta form
+        case '%':  return readToken();                                           // % is a symbol outside #()
+        case '`':  throw new UnsupportedOperationException(
+            "Reader2 does not yet support syntax-quote (`)");
         default:   break;
       }
       if (isMacro(c1)) throw new UnsupportedOperationException(
@@ -131,24 +149,200 @@ public class Reader2 {
     return PersistentHashSet.createWithCheck(readDelimitedList('}'));
   }
 
-  // Handles a form beginning with '#': #{ set, #_ discard, #! shebang comment. The leading
-  // '#' has NOT been consumed yet. Returns the form, or SKIP for a no-value dispatch.
+  // Symbols used by the wrapping macros, matching LispReader.
+  private static final Symbol QUOTE = Symbol.intern("quote");
+  private static final Symbol THE_VAR = Symbol.intern("var");
+  private static final Symbol DEREF = Symbol.intern("clojure.core", "deref");
+  private static final Symbol UNQUOTE = Symbol.intern("clojure.core", "unquote");
+  private static final Symbol UNQUOTE_SPLICING = Symbol.intern("clojure.core", "unquote-splicing");
+  private static final Symbol SYM_INF = Symbol.intern("Inf");
+  private static final Symbol SYM_NEG_INF = Symbol.intern("-Inf");
+  private static final Symbol SYM_NAN = Symbol.intern("NaN");
+
+  // Reads a required form (end of input is an error), as the reader macros do.
+  private Object readForm() throws IOException {
+    Object o = read0(0);
+    if (o == READ_EOF) throw new RuntimeException("EOF while reading");
+    return o;
+  }
+
+  // '~' just read: ~@form -> (unquote-splicing form), ~form -> (unquote form).
+  private Object readUnquote() throws IOException {
+    if (buffer.peek() == '@') { buffer.read(); return RT.list(UNQUOTE_SPLICING, readForm()); }
+    return RT.list(UNQUOTE, readForm());
+  }
+
+  // Handles a form beginning with '#'. The leading '#' has NOT been consumed. Returns the
+  // form, or SKIP for a no-value dispatch (#_, #!).
   private Object readDispatch() throws IOException {
     buffer.read();                          // consume '#'
-    int ch = buffer.read();                 // dispatch char
+    int ch = buffer.peek();                 // dispatch char (consumed below, except for tags)
     if (ch == -1) throw new RuntimeException("EOF while reading character");
     switch (ch) {
-      case '{': return readSet();
+      case '{': buffer.read(); return readSet();
       case '_': {                           // discard the next form
+        buffer.read();
         Object discarded = read0(0);
         if (discarded == READ_EOF) throw new RuntimeException("EOF while reading");
         return SKIP;
       }
-      case '!': skipLine(); return SKIP;    // shebang line comment
+      case '!': buffer.read(); skipLine(); return SKIP;                 // shebang line comment
+      case '\'': buffer.read(); return RT.list(THE_VAR, readForm());    // #'x -> (var x)
+      case '"': buffer.read(); return readRegex();                      // #"..." regex
+      case '#': buffer.read(); return readSymbolicValue();              // ##Inf / ##-Inf / ##NaN
+      case '<': buffer.read(); throw new RuntimeException("Unreadable form");
+      case '?': buffer.read(); throw new RuntimeException("Conditional read not allowed");
+      case ':': buffer.read(); return readNamespaceMap();               // #:ns{...} / #::{...}
       default:
+        if (Character.isLetter(ch)) return readTagged();               // #tag form (leave the letter)
         throw new UnsupportedOperationException(
             "Reader2 does not yet support the dispatch macro '#" + (char) ch + "'");
     }
+  }
+
+  // #"..." — chars up to the closing quote; a backslash keeps the next char literally (so \d
+  // stays \d for Pattern.compile). Port of LispReader.RegexReader.
+  private Object readRegex() throws IOException {
+    Buffer b = buffer;
+    StringBuilder sb = new StringBuilder();
+    while (true) {
+      int ch = b.read();
+      if (ch == '"') break;
+      if (ch == -1) throw new RuntimeException("EOF while reading regex");
+      sb.append((char) ch);
+      if (ch == '\\') {
+        int ch2 = b.read();
+        if (ch2 == -1) throw new RuntimeException("EOF while reading regex");
+        sb.append((char) ch2);
+      }
+    }
+    return java.util.regex.Pattern.compile(sb.toString());
+  }
+
+  // ## symbolic values. Port of LispReader.SymbolicValueReader.
+  private Object readSymbolicValue() throws IOException {
+    Object form = readForm();
+    if (!(form instanceof Symbol)) throw new RuntimeException("Invalid token: ##" + form);
+    if (form.equals(SYM_INF)) return Double.POSITIVE_INFINITY;
+    if (form.equals(SYM_NEG_INF)) return Double.NEGATIVE_INFINITY;
+    if (form.equals(SYM_NAN)) return Double.NaN;
+    throw new RuntimeException("Unknown symbolic value: ##" + form);
+  }
+
+  // #tag form — reads the tag symbol and a form, then applies the matching data reader.
+  private Object readTagged() throws IOException {
+    Object tag = readForm();
+    if (!(tag instanceof Symbol)) throw new RuntimeException("Reader tag must be a symbol");
+    Object form = readForm();
+    IFn reader = dataReaderFor((Symbol) tag);
+    if (reader != null) return reader.invoke(form);
+    throw new RuntimeException("No reader function for tag " + tag);
+  }
+
+  // #:ns{...} / #::{...} / #::alias{...} — the leading "#:" has been consumed. Port of
+  // LispReader.NamespaceMapReader. Unqualified keys get the namespace; keys with the "_"
+  // namespace become unqualified; already-qualified keys are left alone.
+  private Object readNamespaceMap() throws IOException {
+    Buffer b = buffer;
+    boolean auto = false;
+    if (b.peek() == ':') { b.read(); auto = true; }   // #::
+
+    Object osym = null;
+    int nc = b.peek();
+    if (nc == '{') {
+      // no namespace symbol before the map (osym stays null)
+    } else if (nc != -1 && isWhitespace(nc)) {
+      int c = skipWhitespace();
+      if (!(auto && c == '{'))
+        throw new RuntimeException("Namespaced map must specify a namespace");
+    } else {
+      osym = readForm();                              // the namespace symbol (or EOF -> error)
+      if (skipWhitespace() != '{')
+        throw new RuntimeException("Namespaced map must specify a map");
+    }
+
+    String nsname;
+    if (auto) {
+      if (osym == null) {
+        nsname = currentNS().getName().getName();
+      } else if (osym instanceof Symbol && ((Symbol) osym).getNamespace() == null) {
+        Namespace resolved = currentNS().lookupAlias(Symbol.intern(((Symbol) osym).getName()));
+        if (resolved == null)
+          throw new RuntimeException("Unknown auto-resolved namespace alias: " + osym);
+        nsname = resolved.getName().getName();
+      } else {
+        throw new RuntimeException("Namespaced map must specify a valid namespace: " + osym);
+      }
+    } else if (osym instanceof Symbol && ((Symbol) osym).getNamespace() == null) {
+      nsname = ((Symbol) osym).getName();
+    } else {
+      throw new RuntimeException("Namespaced map must specify a valid namespace: " + osym);
+    }
+
+    b.read();                                          // consume '{'
+    ArrayList<Object> kvs = readDelimitedList('}');
+    if ((kvs.size() & 1) == 1)
+      throw new RuntimeException("Namespaced map literal must contain an even number of forms");
+    Object[] out = new Object[kvs.size()];
+    for (int i = 0; i < kvs.size(); i += 2) {
+      out[i] = qualifyKey(kvs.get(i), nsname);
+      out[i + 1] = kvs.get(i + 1);
+    }
+    return RT.map(out);                                // RT.map does the duplicate-key check
+  }
+
+  private static Object qualifyKey(Object key, String nsname) {
+    if (key instanceof Keyword) {
+      Keyword kw = (Keyword) key;
+      if (kw.getNamespace() == null) return Keyword.intern(nsname, kw.getName());
+      if (kw.getNamespace().equals("_")) return Keyword.intern(null, kw.getName());
+      return key;
+    }
+    if (key instanceof Symbol) {
+      Symbol sym = (Symbol) key;
+      if (sym.getNamespace() == null) return Symbol.intern(nsname, sym.getName());
+      if (sym.getNamespace().equals("_")) return Symbol.intern(null, sym.getName());
+      return key;
+    }
+    return key;
+  }
+
+  // Looks up a data reader: *data-readers* first, then default-data-readers (#inst, #uuid).
+  private static IFn dataReaderFor(Symbol tag) {
+    Object r = RT.get(RT.var("clojure.core", "*data-readers*").deref(), tag);
+    if (r == null) r = RT.get(RT.var("clojure.core", "default-data-readers").deref(), tag);
+    return (IFn) r;
+  }
+
+  // ^meta form. Port of LispReader.MetaReader (without source line/column, which RT.readString
+  // also omits for a non-line-numbering reader).
+  private static final Keyword TAG_KEY = Keyword.intern(null, "tag");
+  private static final Keyword PARAM_TAGS_KEY = Keyword.intern(null, "param-tags");
+
+  private Object readMeta() throws IOException {
+    Object meta = readForm();
+    if (meta instanceof Symbol || meta instanceof String)
+      meta = RT.map(TAG_KEY, meta);
+    else if (meta instanceof Keyword)
+      meta = RT.map(meta, Boolean.TRUE);
+    else if (meta instanceof IPersistentVector)
+      meta = RT.map(PARAM_TAGS_KEY, meta);
+    else if (!(meta instanceof IPersistentMap))
+      throw new IllegalArgumentException("Metadata must be Symbol,Keyword,String,Vector or Map");
+
+    Object o = readForm();
+    if (!(o instanceof IMeta))
+      throw new IllegalArgumentException("Metadata can only be applied to IMetas");
+    if (o instanceof IReference) {
+      ((IReference) o).resetMeta((IPersistentMap) meta);
+      return o;
+    }
+    IPersistentMap ometa = RT.meta(o);
+    for (ISeq s = RT.seq(meta); s != null; s = s.next()) {
+      IMapEntry e = (IMapEntry) s.first();
+      ometa = (IPersistentMap) RT.assoc(ometa, e.getKey(), e.getValue());
+    }
+    return ((IObj) o).withMeta(ometa);
   }
 
   private void skipLine() throws IOException {
