@@ -398,6 +398,51 @@ public class Reader2NumberTest {
         "#$", "# ");
   }
 
+  // Runs `body` with clojure.core/*read-eval* bound to `val`.
+  private static Object withReadEval(Object val, java.util.concurrent.Callable<Object> body) {
+    clojure.lang.Var v = RT.var("clojure.core", "*read-eval*");
+    clojure.lang.Var.pushThreadBindings(RT.map(v, val));
+    try {
+      return body.call();
+    } catch (Throwable t) {
+      return t;
+    } finally {
+      clojure.lang.Var.popThreadBindings();
+    }
+  }
+
+  @Test
+  public void testReadEvalGating() {
+    clojure.lang.Keyword unknown = clojure.lang.Keyword.intern(null, "unknown");
+
+    // *read-eval* :unknown disallows all reading, matching LispReader's top-of-read guard.
+    for (String s : new String[]{"#=(+ 1 2)", "(+ 1 2)", "42", ":kw"}) {
+      Object r = withReadEval(unknown, () -> new Reader2(new StringReader(s)).read());
+      assertTrue(r instanceof RuntimeException
+              && "Reading disallowed - *read-eval* bound to :unknown".equals(((Throwable) r).getMessage()),
+          "expected :unknown read-disallowed for \"" + s + "\" but got " + r);
+    }
+
+    // *read-eval* false/nil disables #= with LispReader's exact message; the following form
+    // is not read (the guard fires first), so a malformed inner form is irrelevant.
+    for (Object falsey : new Object[]{Boolean.FALSE, null}) {
+      for (String s : new String[]{"#=(+ 1 2)", "#=junk", "#=x"}) {
+        Object r = withReadEval(falsey, () -> new Reader2(new StringReader(s)).read());
+        assertTrue(r instanceof RuntimeException
+                && "EvalReader not allowed when *read-eval* is false.".equals(((Throwable) r).getMessage()),
+            "expected EvalReader-not-allowed for \"" + s + "\" (read-eval=" + falsey + ") but got " + r);
+      }
+    }
+
+    // With eval enabled, Clojure would evaluate; Reader2 intentionally does not (no compiler).
+    // Only the #= form differs — ordinary forms still read fine under read-eval true.
+    Object plain = withReadEval(Boolean.TRUE, () -> new Reader2(new StringReader("(+ 1 2)")).read());
+    assertEquals(RT.readString("(+ 1 2)"), plain, "ordinary form should read under read-eval true");
+    Object evalForm = withReadEval(Boolean.TRUE, () -> new Reader2(new StringReader("#=(+ 1 2)")).read());
+    assertTrue(evalForm instanceof UnsupportedOperationException,
+        "#= with eval enabled should throw UnsupportedOperationException but got " + evalForm);
+  }
+
   @Test
   public void testCollectionFuzzAgainstClojure() {
     // Random s-expressions built from the reader macros we support, plus atoms.

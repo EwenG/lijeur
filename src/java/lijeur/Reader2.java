@@ -37,7 +37,12 @@ import java.util.regex.Pattern;
  * regex ({@code #"..."}), tagged literals ({@code #inst}/{@code #uuid}/data readers), and
  * namespaced maps ({@code #:ns{...}} / {@code #::{...}}). {@link #read()} skips leading
  * whitespace and reads a single form; a not-yet-supported macro (syntax-quote {@code `},
- * anonymous fn {@code #(}, {@code #=}) throws {@link UnsupportedOperationException}.
+ * anonymous fn {@code #(}) throws {@link UnsupportedOperationException}.
+ *
+ * <p>{@code *read-eval*} is honoured: {@code :unknown} disallows all reading, and the
+ * {@code #=} eval reader throws when {@code *read-eval*} is {@code false}/{@code nil}.
+ * Actually evaluating {@code #=} forms is out of scope (it needs the compiler), so a
+ * {@code #=} form with eval enabled throws {@link UnsupportedOperationException}.
  *
  * <p>Tokens are scanned directly over the {@link Buffer} backing array (no per-character
  * method dispatch). The common number case — a plain decimal {@code long} — plus hex,
@@ -77,8 +82,16 @@ public class Reader2 {
   private static final Object READ_FINISHED = new Object();  // hit the expected closing delimiter
   private static final Object SKIP = new Object();           // no value (comment / discard); continue
 
+  // *read-eval* gating, mirroring LispReader. :unknown disallows all reading; false/nil
+  // additionally disables the #= eval reader.
+  private static final clojure.lang.Var READ_EVAL = RT.var("clojure.core", "*read-eval*");
+  private static final Keyword UNKNOWN = Keyword.intern(null, "unknown");
+
   /** Reads one form, or returns {@link #EOF} at end of input. */
   public Object read() throws IOException {
+    // LispReader guards the top of read() the same way: :unknown blocks everything.
+    if (READ_EVAL.deref() == UNKNOWN)
+      throw new RuntimeException("Reading disallowed - *read-eval* bound to :unknown");
     Object o = read0(0);
     return o == READ_EOF ? EOF : o;
   }
@@ -192,6 +205,15 @@ public class Reader2 {
       case '#': buffer.read(); return readSymbolicValue();              // ##Inf / ##-Inf / ##NaN
       case '<': buffer.read(); throw new RuntimeException("Unreadable form");
       case '?': buffer.read(); throw new RuntimeException("Conditional read not allowed");
+      case '=': {                             // #= read-eval
+        buffer.read();
+        // EvalReader checks *read-eval* before reading its form; false/nil throws exactly this.
+        if (!RT.booleanCast(READ_EVAL.deref()))
+          throw new RuntimeException("EvalReader not allowed when *read-eval* is false.");
+        // Evaluating would require the compiler; that is intentionally out of scope. The
+        // *read-eval* gating above is the security-relevant behaviour and matches LispReader.
+        throw new UnsupportedOperationException("Reader2 does not support #= read-eval");
+      }
       case ':': buffer.read(); return readNamespaceMap();               // #:ns{...} / #::{...}
       default:
         if (Character.isLetter(ch)) return readTagged();               // #tag form (leave the letter)
