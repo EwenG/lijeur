@@ -42,7 +42,9 @@ public class Reader2NumberTest {
       Object actual = reader2Read(input, chunk);
 
       if (clojureThrew) {
-        assertTrue(actual instanceof Throwable,
+        // Reader2 returns its EOF sentinel for a formless top-level input (e.g. a bare
+        // comment) where Clojure's read-string throws EOF — an intentional API difference.
+        assertTrue(actual instanceof Throwable || actual == Reader2.EOF,
             "Clojure threw " + expected.getClass().getSimpleName()
                 + " but Reader2 returned " + actual + " for \"" + input + "\" (chunk=" + chunk + ")");
         continue;
@@ -279,6 +281,77 @@ public class Reader2NumberTest {
   @Test
   public void testCharacterFollowedByDelimiter() {
     assertAllMatchClojure("\\a)", "\\a b", "\\newline;c", "\\space]", "\\1 2", "\\( x");
+  }
+
+  @Test
+  public void testLists() {
+    assertAllMatchClojure("(1 2 3)", "()", "(a b c)", "( 1  2 )", "(1,2,3)",
+        "(+ 1 2)", "(nil true false)", "(())", "(1 (2 (3)))", "(:a :b)", "(1 2 . 3)");
+  }
+
+  @Test
+  public void testVectors() {
+    assertAllMatchClojure("[1 2 3]", "[]", "[a b c]", "[[1] [2]]", "[1,2,3]",
+        "[nil true]", "[[[]]]", "[:x :y :z]", "[\"s\" \\c 1]");
+  }
+
+  @Test
+  public void testMaps() {
+    assertAllMatchClojure("{:a 1 :b 2}", "{}", "{\"k\" \"v\"}", "{1 2 3 4}",
+        "{:a {:b 1}}", "{:x [1 2]}", "{:a 1, :b 2, :c 3}");
+  }
+
+  @Test
+  public void testSets() {
+    assertAllMatchClojure("#{1 2 3}", "#{}", "#{:a :b}", "#{\"x\" \"y\"}",
+        "#{1 [2] :three}", "#{nil true false}");
+  }
+
+  @Test
+  public void testNestedCollections() {
+    assertAllMatchClojure("(1 [2 3] {:x 4})", "[{:a #{1 2}} (3 4)]",
+        "{:list (1 2 3) :vec [4 5]}", "(((1)))", "[() [] {} #{}]", "{[1 2] #{3 4}}");
+  }
+
+  @Test
+  public void testCollectionErrors() {
+    assertAllMatchClojure(")", "]", "}", "(1 2", "[1 2", "{:a 1", "#{1 2",
+        "(1 ] )", "[1 2 3)", "{:a}", "{:a 1 :a 2}", "#{1 1}", "{:a 1 :b 2 :c}");
+  }
+
+  @Test
+  public void testComments() {
+    assertAllMatchClojure("; comment\n42", "(1 ; c\n 2)", "#! shebang\n7",
+        "42 ; trailing", "[1 ;; c\n 2 3]", "; only-first\n(a b)");
+  }
+
+  @Test
+  public void testDiscard() {
+    assertAllMatchClojure("#_ 1 2", "(1 #_2 3)", "[#_#_1 2 3]", "#_(1 2) 99",
+        "{:a #_:skip 1}", "#_#_1 2 3", "(#_1)", "[1 #_ ; c\n 2 3]");
+  }
+
+  @Test
+  public void testCollectionFuzzAgainstClojure() {
+    // Random s-expressions built from the reader macros we support, plus atoms.
+    String[] atoms = {"1", "-2", "3.5", "foo", ":kw", "a/b", "\"s\"", "\\c", "nil",
+        "true", "1/2", "0xff", "#_9", ";x\n"};
+    String[] open = {"(", "[", "{", "#{"};
+    String[] close = {")", "]", "}", "}"};
+    java.util.Random rnd = new java.util.Random(0xDEADBEEFL);
+    for (int t = 0; t < 20000; t++) {
+      StringBuilder sb = new StringBuilder();
+      java.util.Deque<String> stack = new java.util.ArrayDeque<>();
+      int tokens = 1 + rnd.nextInt(14);
+      for (int i = 0; i < tokens; i++) {
+        int r = rnd.nextInt(10);
+        if (r < 3 && stack.size() < 5) { int k = rnd.nextInt(open.length); sb.append(open[k]).append(' '); stack.push(close[k]); }
+        else if (r < 4 && !stack.isEmpty()) { sb.append(stack.pop()).append(' '); }
+        else { sb.append(atoms[rnd.nextInt(atoms.length)]).append(' '); }
+      }
+      while (!stack.isEmpty()) sb.append(stack.pop()).append(' ');   // usually balanced
+      assertMatchesClojure(sb.toString().trim());
+    }
   }
 
   @Test

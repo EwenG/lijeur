@@ -2,12 +2,16 @@ package lijeur;
 
 import clojure.lang.BigInt;
 import clojure.lang.Keyword;
+import clojure.lang.LazilyPersistentVector;
 import clojure.lang.Namespace;
 import clojure.lang.Numbers;
+import clojure.lang.PersistentHashSet;
+import clojure.lang.PersistentList;
 import clojure.lang.RT;
 import clojure.lang.Symbol;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.regex.Matcher;
@@ -17,10 +21,12 @@ import java.util.regex.Pattern;
  * A fast Clojure/EDN reader built on {@link Buffer}. Behaviour matches Clojure
  * 1.12.5's {@code LispReader}.
  *
- * <p>Scope so far: numbers, symbols, keywords, strings, characters, and the literals
- * {@code nil} / {@code true} / {@code false}. {@link #read()} skips leading whitespace and
- * reads a single form; a form starting with a not-yet-supported reader-macro character
- * (e.g. {@code (}, {@code [}, {@code #}) throws {@link UnsupportedOperationException}.
+ * <p>Scope so far: numbers, symbols, keywords, strings, characters, the literals
+ * {@code nil} / {@code true} / {@code false}, collections ({@code (...)}, {@code [...]},
+ * {@code {...}}, {@code #{...}}), and comments ({@code ;}, {@code #!}, {@code #_}).
+ * {@link #read()} skips leading whitespace and reads a single form; a form starting with a
+ * not-yet-supported reader macro (e.g. {@code '}, {@code @}, {@code #"}) throws
+ * {@link UnsupportedOperationException}.
  *
  * <p>Tokens are scanned directly over the {@link Buffer} backing array (no per-character
  * method dispatch). The common number case — a plain decimal {@code long} — plus hex,
@@ -55,21 +61,114 @@ public class Reader2 {
     this(r, DEFAULT_CHUNK_SIZE);
   }
 
+  // Internal control-flow sentinels, mirroring LispReader's read loop.
+  private static final Object READ_EOF = new Object();       // end of input
+  private static final Object READ_FINISHED = new Object();  // hit the expected closing delimiter
+  private static final Object SKIP = new Object();           // no value (comment / discard); continue
+
   /** Reads one form, or returns {@link #EOF} at end of input. */
   public Object read() throws IOException {
-    int c1 = skipWhitespace();
-    if (c1 == -1) return EOF;
-    if (Character.isDigit(c1)) return readNumber();
-    if (c1 == '"') { buffer.read(); return readStringForm(); }
-    if (c1 == '\\') { buffer.read(); return readCharacterForm(); }
-    if (isMacro(c1)) throw new UnsupportedOperationException(
-        "Reader2 does not yet support the reader macro '" + (char) c1 + "'");
-    if ((c1 == '+' || c1 == '-') && Character.isDigit(peekAt(1))) return readNumber();
-    return readToken();   // symbols, keywords, nil / true / false
+    Object o = read0(0);
+    return o == READ_EOF ? EOF : o;
+  }
+
+  // Reads one form. `returnOn` is the closing delimiter to stop on (0 = none): on it, consumes
+  // the delimiter and returns READ_FINISHED. Returns READ_EOF at end of input. Loops over
+  // comments and #_ discards (which produce no value), matching LispReader's read loop.
+  private Object read0(int returnOn) throws IOException {
+    while (true) {
+      int c1 = skipWhitespace();
+      if (c1 == -1) return READ_EOF;
+      if (returnOn != 0 && c1 == returnOn) { buffer.read(); return READ_FINISHED; }
+      if (Character.isDigit(c1)) return readNumber();
+      switch (c1) {
+        case '"':  buffer.read(); return readStringForm();
+        case '\\': buffer.read(); return readCharacterForm();
+        case '(':  buffer.read(); return readList();
+        case '[':  buffer.read(); return readVector();
+        case '{':  buffer.read(); return readMap();
+        case ')': case ']': case '}':
+          throw new RuntimeException("Unmatched delimiter: " + (char) c1);
+        case ';':  buffer.read(); skipLine(); continue;         // line comment
+        case '#':  { Object o = readDispatch(); if (o == SKIP) continue; return o; }
+        default:   break;
+      }
+      if (isMacro(c1)) throw new UnsupportedOperationException(
+          "Reader2 does not yet support the reader macro '" + (char) c1 + "'");
+      if ((c1 == '+' || c1 == '-') && Character.isDigit(peekAt(1))) return readNumber();
+      return readToken();   // symbols, keywords, nil / true / false
+    }
+  }
+
+  // Reads forms until the closing `delim`, collecting them. Port of readDelimitedList.
+  private ArrayList<Object> readDelimitedList(int delim) throws IOException {
+    ArrayList<Object> acc = new ArrayList<>();
+    while (true) {
+      Object form = read0(delim);
+      if (form == READ_EOF) throw new RuntimeException("EOF while reading");
+      if (form == READ_FINISHED) return acc;
+      acc.add(form);
+    }
+  }
+
+  private Object readList() throws IOException {
+    ArrayList<Object> a = readDelimitedList(')');
+    return a.isEmpty() ? PersistentList.EMPTY : PersistentList.create(a);
+  }
+
+  private Object readVector() throws IOException {
+    return LazilyPersistentVector.create(readDelimitedList(']'));
+  }
+
+  private Object readMap() throws IOException {
+    Object[] a = readDelimitedList('}').toArray();
+    if ((a.length & 1) == 1)
+      throw new RuntimeException("Map literal must contain an even number of forms");
+    return RT.map(a);                       // RT.map does the duplicate-key check
+  }
+
+  private Object readSet() throws IOException {
+    return PersistentHashSet.createWithCheck(readDelimitedList('}'));
+  }
+
+  // Handles a form beginning with '#': #{ set, #_ discard, #! shebang comment. The leading
+  // '#' has NOT been consumed yet. Returns the form, or SKIP for a no-value dispatch.
+  private Object readDispatch() throws IOException {
+    buffer.read();                          // consume '#'
+    int ch = buffer.read();                 // dispatch char
+    if (ch == -1) throw new RuntimeException("EOF while reading character");
+    switch (ch) {
+      case '{': return readSet();
+      case '_': {                           // discard the next form
+        Object discarded = read0(0);
+        if (discarded == READ_EOF) throw new RuntimeException("EOF while reading");
+        return SKIP;
+      }
+      case '!': skipLine(); return SKIP;    // shebang line comment
+      default:
+        throw new UnsupportedOperationException(
+            "Reader2 does not yet support the dispatch macro '#" + (char) ch + "'");
+    }
+  }
+
+  private void skipLine() throws IOException {
+    Buffer b = buffer;
+    while (true) {
+      int c = b.read();
+      if (c == -1 || c == '\n' || c == '\r') return;
+    }
+  }
+
+  // ASCII whitespace (plus comma) lookup for the hot path; matches `ch == ',' ||
+  // Character.isWhitespace(ch)` for ch < 128.
+  private static final boolean[] WS = new boolean[128];
+  static {
+    WS[','] = true;
+    for (int i = 0; i < 128; i++) if (Character.isWhitespace(i)) WS[i] = true;
   }
 
   private static boolean isWhitespace(int ch) {
-    return ch == ',' || Character.isWhitespace(ch);
+    return ch < 128 ? WS[ch] : Character.isWhitespace(ch);
   }
 
   private static boolean isMacro(int ch) {
@@ -83,14 +182,19 @@ public class Reader2 {
   }
 
   // Consumes leading whitespace; returns the next non-whitespace char (not consumed),
-  // or -1 at end of input.
+  // or -1 at end of input. Scans the backing array directly to avoid per-char peek/read.
   private int skipWhitespace() throws IOException {
     Buffer b = buffer;
     while (true) {
-      int c = b.peek();
-      if (c == -1) return -1;
-      if (isWhitespace(c)) { b.read(); continue; }
-      return c;
+      char[] a = b.buffer;
+      int p = b.pos, end = b.posEnd;
+      while (p < end) {
+        char c = a[p];
+        if (!isWhitespace(c)) { b.pos = p; return c; }
+        p++;
+      }
+      b.pos = p;
+      if (!b.refill()) return -1;
     }
   }
 
@@ -138,22 +242,28 @@ public class Reader2 {
     b.startNewToken();
     // Scan the token directly, stopping at whitespace, a terminating macro, or end of
     // input (matching LispReader.readToken). Note: #, ' and % do NOT terminate a token.
+    // Along the way, flag whether the token has a '/' or a non-leading ':' — if not, it is
+    // a plain symbol/keyword and can skip the full matchSymbol machinery.
+    int ts = b.getTokenStart();
     int p = b.pos;
     char[] a = b.buffer;
+    boolean special = false;
     while (true) {
       char c = a[p];
       if (c == Buffer.SENTINEL && p == b.posEnd) {
         b.pos = p;
-        if (!b.refill()) { a = b.buffer; p = b.posEnd; break; }  // EOF (refill may have compacted)
+        if (!b.refill()) { a = b.buffer; ts = b.getTokenStart(); p = b.posEnd; break; }
         a = b.buffer;
+        ts = b.getTokenStart();
         p = b.pos;
         continue;
       }
       if (isWhitespace(c) || isTerminatingMacro(c)) break;
+      if (c == '/' || (c == ':' && p != ts)) special = true;
       p++;
     }
     b.pos = p;
-    return interpretToken(new String(a, b.getTokenStart(), p - b.getTokenStart()));
+    return interpretToken(a, ts, p, special);
   }
 
   // Reads a string form (opening quote already consumed). Port of LispReader.StringReader.
@@ -322,14 +432,68 @@ public class Reader2 {
     return uc;
   }
 
-  // Port of LispReader.interpretToken: nil / true / false, then symbol/keyword.
-  private static Object interpretToken(String s) {
-    if (s.equals("nil")) return null;
-    if (s.equals("true")) return Boolean.TRUE;
-    if (s.equals("false")) return Boolean.FALSE;
+  // nil / true / false, then symbol/keyword. `special` is true when the token contains a '/'
+  // or a non-leading ':', which are the only cases needing the full matchSymbol logic; the
+  // common plain symbol/keyword goes straight to Symbol.intern / Keyword.intern.
+  private Object interpretToken(char[] a, int start, int end, boolean special) {
+    int len = end - start;
+    if (!special) {
+      char c0 = a[start];
+      if (c0 == ':') {
+        if (len >= 2)   // plain keyword :name
+          return internPlain(a, start, len, true);
+        // ":" alone falls through to the full path (invalid token)
+      } else {
+        if (len == 3 && c0 == 'n' && a[start + 1] == 'i' && a[start + 2] == 'l')
+          return null;
+        if (len == 4 && c0 == 't' && a[start + 1] == 'r' && a[start + 2] == 'u' && a[start + 3] == 'e')
+          return Boolean.TRUE;
+        if (len == 5 && c0 == 'f' && a[start + 1] == 'a' && a[start + 2] == 'l'
+            && a[start + 3] == 's' && a[start + 4] == 'e')
+          return Boolean.FALSE;
+        return internPlain(a, start, len, false);   // plain symbol
+      }
+    }
+    String s = new String(a, start, len);
     Object ret = matchSymbol(s);
     if (ret != null) return ret;
     throw new RuntimeException("Invalid token: " + s);
+  }
+
+  // Per-reader cache from a token's char range to its interned Symbol/Keyword, so a repeated
+  // plain token (extremely common in real code) skips the String allocation and the
+  // Symbol/Keyword intern. Lazily allocated; a hash collision just recomputes (still correct).
+  // Keyed on the whole range including any leading ':', so symbols and keywords never collide.
+  private char[][] tokKey;
+  private Object[] tokVal;
+  private int tokSeen;
+  private static final int TOK_MASK = 1023;
+  private static final int TOK_CACHE_AFTER = 32;   // don't allocate the cache for small reads
+
+  private Object internPlain(char[] a, int start, int len, boolean keyword) {
+    char[][] keys = tokKey;
+    if (keys == null) {
+      if (++tokSeen <= TOK_CACHE_AFTER)
+        return keyword ? Keyword.intern(Symbol.intern(new String(a, start + 1, len - 1)))
+                       : Symbol.intern(new String(a, start, len));
+      keys = tokKey = new char[TOK_MASK + 1][];
+      tokVal = new Object[TOK_MASK + 1];
+    }
+    int h = 0;
+    for (int i = 0; i < len; i++) h = h * 31 + a[start + i];
+    int idx = h & TOK_MASK;
+    char[] k = keys[idx];
+    if (k != null && k.length == len) {
+      int i = 0;
+      while (i < len && k[i] == a[start + i]) i++;
+      if (i == len) return tokVal[idx];
+    }
+    Object v = keyword
+        ? Keyword.intern(Symbol.intern(new String(a, start + 1, len - 1)))
+        : Symbol.intern(new String(a, start, len));
+    keys[idx] = java.util.Arrays.copyOfRange(a, start, start + len);
+    tokVal[idx] = v;
+    return v;
   }
 
   // Hand-rolled equivalent of LispReader.matchSymbol (Clojure 1.12.5), avoiding a regex on
