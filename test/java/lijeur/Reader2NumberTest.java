@@ -400,7 +400,12 @@ public class Reader2NumberTest {
 
   // Runs `body` with clojure.core/*read-eval* bound to `val`.
   private static Object withReadEval(Object val, java.util.concurrent.Callable<Object> body) {
-    clojure.lang.Var v = RT.var("clojure.core", "*read-eval*");
+    return withVar("*read-eval*", val, body);
+  }
+
+  // Runs `body` with the named clojure.core dynamic var bound to `val`.
+  private static Object withVar(String varName, Object val, java.util.concurrent.Callable<Object> body) {
+    clojure.lang.Var v = RT.var("clojure.core", varName);
     clojure.lang.Var.pushThreadBindings(RT.map(v, val));
     try {
       return body.call();
@@ -410,6 +415,31 @@ public class Reader2NumberTest {
       clojure.lang.Var.popThreadBindings();
     }
   }
+
+  @Test
+  public void testDefaultDataReaderFn() {
+    // A default-data-reader-fn that tags the (tag, form) pair, matching Clojure's call order.
+    clojure.lang.IFn f = new clojure.lang.AFn() {
+      @Override public Object invoke(Object tag, Object form) { return RT.map(TAG_KW, tag, FORM_KW, form); }
+    };
+    for (String s : new String[]{"#foo/bar 42", "#unknown [1 2]"}) {
+      Object expected = withVar("*default-data-reader-fn*", f, () -> RT.readString(s));
+      for (int chunk : CHUNK_SIZES) {
+        Object actual = withVar("*default-data-reader-fn*", f, () -> new Reader2(new StringReader(s), chunk).read());
+        assertEquals(expected, actual, "default-data-reader-fn mismatch for \"" + s + "\" (chunk=" + chunk + ")");
+      }
+    }
+    // A registered reader (#inst) wins over the default fn — it is never consulted.
+    Object inst = withVar("*default-data-reader-fn*", f, () -> new Reader2(new StringReader("#inst \"2020-01-01\"")).read());
+    assertEquals(RT.readString("#inst \"2020-01-01\""), inst, "registered reader should bypass default fn");
+    // A dotted tag is a record literal (unsupported): both Clojure and Reader2 throw, and the
+    // default fn must NOT be invoked (else Reader2 would wrongly return a value).
+    Object rec = withVar("*default-data-reader-fn*", f, () -> new Reader2(new StringReader("#my.Rec{:a 1}")).read());
+    assertTrue(rec instanceof Throwable, "dotted (record) tag must throw, not hit the default fn, but got " + rec);
+  }
+
+  private static final clojure.lang.Keyword TAG_KW = clojure.lang.Keyword.intern(null, "tag");
+  private static final clojure.lang.Keyword FORM_KW = clojure.lang.Keyword.intern(null, "form");
 
   @Test
   public void testReadEvalGating() {
@@ -441,6 +471,122 @@ public class Reader2NumberTest {
     Object evalForm = withReadEval(Boolean.TRUE, () -> new Reader2(new StringReader("#=(+ 1 2)")).read());
     assertTrue(evalForm instanceof UnsupportedOperationException,
         "#= with eval enabled should throw UnsupportedOperationException but got " + evalForm);
+  }
+
+  // Canonicalizes gensym symbols (p1__N#, foo__N__auto__) by first-appearance order, so two
+  // syntax-quote / #() expansions that differ only in the global RT.nextID() counter compare
+  // equal. Rebuilds every collection so the comparison is structural. (Broad differential
+  // coverage — including the inherently order-nondeterministic set/map-under-nested-quote
+  // cases — is done separately against Clojure 1.12.5; these are deterministic regressions.)
+  private static Object normGensyms(Object form, java.util.Map<clojure.lang.Symbol, clojure.lang.Symbol> m, int[] ctr) {
+    if (form instanceof clojure.lang.Symbol) {
+      clojure.lang.Symbol s = (clojure.lang.Symbol) form;
+      String nm = s.getName();
+      if (nm.matches(".*__\\d+__auto__") || nm.matches(".*__\\d+#")) {
+        clojure.lang.Symbol canon = m.get(s);
+        if (canon == null) {
+          canon = clojure.lang.Symbol.intern(s.getNamespace(), nm.replaceAll("__\\d+", "__G" + (++ctr[0])));
+          m.put(s, canon);
+        }
+        return canon;
+      }
+      return s;
+    }
+    if (form instanceof clojure.lang.IPersistentVector) {
+      clojure.lang.IPersistentVector v = (clojure.lang.IPersistentVector) form;
+      java.util.ArrayList<Object> out = new java.util.ArrayList<>();
+      for (int i = 0; i < v.count(); i++) out.add(normGensyms(v.nth(i), m, ctr));
+      return clojure.lang.LazilyPersistentVector.create(out);
+    }
+    if (form instanceof clojure.lang.IPersistentMap) {
+      java.util.ArrayList<Object> kvs = new java.util.ArrayList<>();
+      for (clojure.lang.ISeq s = RT.seq(form); s != null; s = s.next()) {
+        clojure.lang.IMapEntry e = (clojure.lang.IMapEntry) s.first();
+        kvs.add(normGensyms(e.key(), m, ctr));
+        kvs.add(normGensyms(e.val(), m, ctr));
+      }
+      return RT.map(kvs.toArray());
+    }
+    if (form instanceof clojure.lang.IPersistentSet) {
+      java.util.ArrayList<Object> es = new java.util.ArrayList<>();
+      for (clojure.lang.ISeq s = RT.seq(form); s != null; s = s.next()) es.add(normGensyms(s.first(), m, ctr));
+      return clojure.lang.PersistentHashSet.create(es);
+    }
+    if (form instanceof clojure.lang.ISeq || form instanceof clojure.lang.IPersistentList) {
+      java.util.ArrayList<Object> out = new java.util.ArrayList<>();
+      for (clojure.lang.ISeq s = RT.seq(form); s != null; s = s.next()) out.add(normGensyms(s.first(), m, ctr));
+      return out.isEmpty() ? clojure.lang.PersistentList.EMPTY : clojure.lang.PersistentList.create(out);
+    }
+    return form;
+  }
+
+  // Asserts Reader2 matches Clojure for a syntax-quote / #() form, modulo gensym numbering.
+  private static void assertGensymMatch(String input) {
+    Object expected = clojureRead(input);
+    boolean threw = expected instanceof Throwable;
+    for (int chunk : CHUNK_SIZES) {
+      Object actual = reader2Read(input, chunk);
+      if (threw) {
+        assertTrue(actual instanceof Throwable,
+            "Clojure threw but Reader2 returned " + actual + " for \"" + input + "\" (chunk=" + chunk + ")");
+        continue;
+      }
+      assertFalse(actual instanceof Throwable,
+          "Clojure read " + expected + " but Reader2 threw " + actual + " for \"" + input + "\" (chunk=" + chunk + ")");
+      assertEquals(expected.getClass(), actual.getClass(),
+          "type mismatch for \"" + input + "\" (chunk=" + chunk + ")");
+      Object ne = normGensyms(expected, new java.util.HashMap<>(), new int[]{0});
+      Object na = normGensyms(actual, new java.util.HashMap<>(), new int[]{0});
+      assertEquals(ne, na, "syntax-quote/fn mismatch for \"" + input + "\" (chunk=" + chunk + ")");
+    }
+  }
+
+  @Test
+  public void testSyntaxQuoteSimple() {
+    // No gensyms — must match Clojure exactly (including class + resolution).
+    assertAllMatchClojure("`x", "`5", "`:kw", "`\"s\"", "`nil", "`true",
+        "`map", "`inc", "`foo/bar", "`clojure.core/map", "`if", "`do", "`let*", "`fn*",
+        "`quote", "`recur", "`.foo", "`Foo.", "`()", "`(a b c)", "`[a b c]", "`{:a 1 :b 2}",
+        "`#{a b c}", "`~x", "`~@x", "`(a ~b c)", "`(a ~@b c)", "`(1 ~(+ 1 2) 3)", "``x");
+  }
+
+  @Test
+  public void testSyntaxQuoteGensym() {
+    // Auto-gensyms in deterministic (list/vector) contexts.
+    assertGensymMatch("`x#");
+    assertGensymMatch("`(x# x#)");
+    assertGensymMatch("`[a# a# b#]");
+    assertGensymMatch("`(let [x# 1] x#)");
+    assertGensymMatch("`(fn [a#] (+ a# a#))");
+    assertGensymMatch("`(~x x# ~@ys x#)");
+  }
+
+  @Test
+  public void testSyntaxQuoteErrors() {
+    assertAllMatchClojure("`~@x", "`");   // splice-not-in-list, EOF
+  }
+
+  @Test
+  public void testAnonymousFn() {
+    assertGensymMatch("#(+ % 1)");
+    assertGensymMatch("#(+ %1 %2)");
+    assertGensymMatch("#()");
+    assertGensymMatch("#(inc %)");
+    assertGensymMatch("#(list % %2 %3)");
+    assertGensymMatch("#(apply + %&)");
+    assertGensymMatch("#(list %1 %&)");
+    assertGensymMatch("#(vector %2)");            // %2 without %1 -> generated p1
+    assertGensymMatch("#(do %)");
+    assertGensymMatch("#(#{%})");
+    assertGensymMatch("#([% %2])");
+    assertGensymMatch("#({:a %})");
+    assertGensymMatch("'#(+ % 1)");               // quoted fn literal
+    assertGensymMatch("`#(inc %)");               // syntax-quoted fn literal
+  }
+
+  @Test
+  public void testAnonymousFnErrors() {
+    assertAllMatchClojure("#(#(+ % 1))", "%1", "#(%bad %)", "#(% ");   // nested #(), % outside, bad arg, EOF
   }
 
   @Test

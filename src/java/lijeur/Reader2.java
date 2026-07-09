@@ -5,8 +5,12 @@ import clojure.lang.IFn;
 import clojure.lang.IMapEntry;
 import clojure.lang.IMeta;
 import clojure.lang.IObj;
+import clojure.lang.IPersistentCollection;
+import clojure.lang.IPersistentList;
 import clojure.lang.IPersistentMap;
+import clojure.lang.IPersistentSet;
 import clojure.lang.IPersistentVector;
+import clojure.lang.IRecord;
 import clojure.lang.IReference;
 import clojure.lang.ISeq;
 import clojure.lang.Keyword;
@@ -15,6 +19,7 @@ import clojure.lang.Namespace;
 import clojure.lang.Numbers;
 import clojure.lang.PersistentHashSet;
 import clojure.lang.PersistentList;
+import clojure.lang.PersistentVector;
 import clojure.lang.RT;
 import clojure.lang.Symbol;
 
@@ -35,9 +40,10 @@ import java.util.regex.Pattern;
  * quote ({@code '}), deref ({@code @}), var ({@code #'}), unquote ({@code ~}/{@code ~@}),
  * metadata ({@code ^}), symbolic values ({@code ##Inf}/{@code ##-Inf}/{@code ##NaN}),
  * regex ({@code #"..."}), tagged literals ({@code #inst}/{@code #uuid}/data readers), and
- * namespaced maps ({@code #:ns{...}} / {@code #::{...}}). {@link #read()} skips leading
- * whitespace and reads a single form; a not-yet-supported macro (syntax-quote {@code `},
- * anonymous fn {@code #(}) throws {@link UnsupportedOperationException}.
+ * namespaced maps ({@code #:ns{...}} / {@code #::{...}}), syntax-quote ({@code `} with
+ * {@code ~}/{@code ~@} expansion and auto-gensym {@code foo#}), and the anonymous fn literal
+ * ({@code #(...)} with {@code %}/{@code %n}/{@code %&}). {@link #read()} skips leading
+ * whitespace and reads a single form.
  *
  * <p>{@code *read-eval*} is honoured: {@code :unknown} disallows all reading, and the
  * {@code #=} eval reader throws when {@code *read-eval*} is {@code false}/{@code nil}.
@@ -119,13 +125,11 @@ public class Reader2 {
         case '@':  buffer.read(); return RT.list(DEREF, readForm());             // @x
         case '~':  buffer.read(); return readUnquote();                          // ~x / ~@x
         case '^':  buffer.read(); return readMeta();                             // ^meta form
-        case '%':  return readToken();                                           // % is a symbol outside #()
-        case '`':  throw new UnsupportedOperationException(
-            "Reader2 does not yet support syntax-quote (`)");
+        case '%':  return argEnv != null ? readArg() : readToken();              // %/%n/%& in #(), else symbol
+        case '`':  buffer.read(); return readSyntaxQuote();                      // `form
         default:   break;
       }
-      if (isMacro(c1)) throw new UnsupportedOperationException(
-          "Reader2 does not yet support the reader macro '" + (char) c1 + "'");
+      // Every macro character has an explicit case above, so anything reaching here is a token.
       if ((c1 == '+' || c1 == '-') && Character.isDigit(peekAt(1))) return readNumber();
       return readToken();   // symbols, keywords, nil / true / false
     }
@@ -172,6 +176,67 @@ public class Reader2 {
   private static final Symbol SYM_NEG_INF = Symbol.intern("-Inf");
   private static final Symbol SYM_NAN = Symbol.intern("NaN");
 
+  // Symbols used by #() and syntax-quote expansion, matching LispReader / Compiler.
+  private static final Symbol FN = Symbol.intern("fn*");            // Compiler.FN
+  private static final Symbol AMP = Symbol.intern("&");             // Compiler._AMP_
+  private static final Symbol APPLY = Symbol.intern("clojure.core", "apply");
+  private static final Symbol HASHMAP = Symbol.intern("clojure.core", "hash-map");
+  private static final Symbol HASHSET = Symbol.intern("clojure.core", "hash-set");
+  private static final Symbol VECTOR = Symbol.intern("clojure.core", "vector");
+  private static final Symbol SEQ = Symbol.intern("clojure.core", "seq");
+  private static final Symbol CONCAT = Symbol.intern("clojure.core", "concat");
+  private static final Symbol LIST = Symbol.intern("clojure.core", "list");
+  private static final Symbol WITH_META = Symbol.intern("clojure.core", "with-meta");
+  private static final Keyword LINE_KEY = Keyword.intern(null, "line");
+  private static final Keyword COLUMN_KEY = Keyword.intern(null, "column");
+
+  // syntaxQuote defers symbol resolution to Compiler.isSpecial / Compiler.resolveSymbol so that
+  // class mappings, referred vars, and current-ns defaulting are byte-identical to Clojure's.
+  // Both are package-private, so reflect them once.
+  private static final java.lang.reflect.Method IS_SPECIAL;
+  private static final java.lang.reflect.Method RESOLVE_SYMBOL;
+  static {
+    try {
+      IS_SPECIAL = clojure.lang.Compiler.class.getDeclaredMethod("isSpecial", Object.class);
+      IS_SPECIAL.setAccessible(true);
+      RESOLVE_SYMBOL = clojure.lang.Compiler.class.getDeclaredMethod("resolveSymbol", Symbol.class);
+      RESOLVE_SYMBOL.setAccessible(true);
+    } catch (NoSuchMethodException e) {
+      throw new ExceptionInInitializerError(e);
+    }
+  }
+
+  private static boolean isSpecial(Object form) {
+    try {
+      return (Boolean) IS_SPECIAL.invoke(null, form);
+    } catch (java.lang.reflect.InvocationTargetException e) {
+      throw sneak(e.getCause());
+    } catch (IllegalAccessException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static Symbol resolveSymbol(Symbol sym) {
+    try {
+      return (Symbol) RESOLVE_SYMBOL.invoke(null, sym);
+    } catch (java.lang.reflect.InvocationTargetException e) {
+      throw sneak(e.getCause());   // propagate Compiler's own exception (e.g. "Unable to resolve")
+    } catch (IllegalAccessException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static RuntimeException sneak(Throwable t) {
+    if (t instanceof RuntimeException) return (RuntimeException) t;
+    if (t instanceof Error) throw (Error) t;
+    return new RuntimeException(t);
+  }
+
+  // Per-read state for #() arg literals and syntax-quote auto-gensyms; null when not inside the
+  // respective macro. These stand in for LispReader's ARG_ENV / GENSYM_ENV thread-local Vars.
+  private java.util.TreeMap<Integer, Symbol> argEnv;       // #() arg map: n -> param symbol
+  private java.util.HashMap<Symbol, Symbol> gensymEnv;     // syntax-quote foo# -> gensym
+
   // Reads a required form (end of input is an error), as the reader macros do.
   private Object readForm() throws IOException {
     Object o = read0(0);
@@ -185,6 +250,199 @@ public class Reader2 {
     return RT.list(UNQUOTE, readForm());
   }
 
+  // ---- Anonymous fn #(...) and arg literals %, %n, %& -------------------------------------
+  // Port of LispReader.FnReader / ArgReader / registerArg / garg. The opening '(' has been
+  // consumed. Reads the body list (during which '%' literals register themselves into argEnv),
+  // then builds (fn* [args] body). Nested #() is rejected, matching LispReader.
+
+  private Object readFn() throws IOException {
+    if (argEnv != null) throw new IllegalStateException("Nested #()s are not allowed");
+    java.util.TreeMap<Integer, Symbol> saved = argEnv;   // null
+    argEnv = new java.util.TreeMap<>();
+    try {
+      Object form = readList();                          // reads to ')', registering % args
+      PersistentVector args = PersistentVector.EMPTY;
+      if (!argEnv.isEmpty()) {
+        int higharg = argEnv.lastKey();                  // highest key (-1 sorts below positives)
+        if (higharg > 0) {
+          for (int i = 1; i <= higharg; i++) {
+            Symbol sym = argEnv.get(i);
+            if (sym == null) sym = garg(i);              // fill gaps, e.g. %2 without %1
+            args = args.cons(sym);
+          }
+        }
+        Symbol restsym = argEnv.get(-1);
+        if (restsym != null) { args = args.cons(AMP); args = args.cons(restsym); }
+      }
+      return RT.list(FN, args, form);
+    } finally {
+      argEnv = saved;
+    }
+  }
+
+  // A generated arg/param symbol, e.g. p1__42# or rest__43#. Port of LispReader.garg.
+  private static Symbol garg(int n) {
+    return Symbol.intern(null, (n == -1 ? "rest" : ("p" + n)) + "__" + RT.nextID() + "#");
+  }
+
+  private Symbol registerArg(int n) {
+    Symbol ret = argEnv.get(n);
+    if (ret == null) { ret = garg(n); argEnv.put(n, ret); }
+    return ret;
+  }
+
+  // '%' seen inside a #(); argEnv is non-null. Reads the token and interprets the arg literal.
+  private Object readArg() throws IOException {
+    // Scan the %-token and interpret it inline — no regex Matcher, no String. The grammar is
+    // just %, %&, or %[1-9][0-9]* (LispReader.argPat), and arg literals can appear many times
+    // in an arg-heavy #(), so this stays on the fast char[] path like the other token scanners.
+    Buffer b = buffer;
+    b.startNewToken();
+    int p = b.pos;
+    char[] a = b.buffer;
+    while (true) {
+      char c = a[p];
+      if (c == Buffer.SENTINEL && p == b.posEnd) {
+        b.pos = p;
+        if (!b.refill()) { a = b.buffer; p = b.posEnd; break; }
+        a = b.buffer; p = b.pos; continue;
+      }
+      if (isWhitespace(c) || isTerminatingMacro(c)) break;
+      p++;
+    }
+    int start = b.getTokenStart();
+    int len = p - start;
+    b.pos = p;
+    if (len == 1) return registerArg(1);                               // %
+    if (len == 2 && a[start + 1] == '&') return registerArg(-1);       // %&
+    char c1 = a[start + 1];
+    if (c1 >= '1' && c1 <= '9') {                                      // %[1-9][0-9]*
+      long n = c1 - '0';
+      boolean digits = true;
+      for (int i = start + 2; i < p; i++) {
+        char d = a[i];
+        if (d < '0' || d > '9') { digits = false; break; }
+        n = n * 10 + (d - '0');
+        if (n > Integer.MAX_VALUE)   // match Integer.parseInt's overflow (both throw)
+          throw new NumberFormatException("For input string: \"" + new String(a, start + 1, len - 1) + "\"");
+      }
+      if (digits) return registerArg((int) n);
+    }
+    throw new IllegalStateException("arg literal must be %, %& or %integer");
+  }
+
+  // ---- Syntax-quote `form ------------------------------------------------------------------
+  // Port of LispReader.SyntaxQuoteReader. A fresh auto-gensym map is scoped to each backquote,
+  // so nested `...` get independent foo# gensyms. Symbol resolution matches Clojure exactly via
+  // the reflected Compiler.isSpecial / resolveSymbol (the *reader-resolver* path, used only when
+  // a custom resolver is bound, is not reachable through this reader's API, so it is omitted).
+  private Object readSyntaxQuote() throws IOException {
+    java.util.HashMap<Symbol, Symbol> saved = gensymEnv;
+    gensymEnv = new java.util.HashMap<>();
+    try {
+      return syntaxQuote(readForm());
+    } finally {
+      gensymEnv = saved;
+    }
+  }
+
+  private Object syntaxQuote(Object form) {
+    Object ret;
+    if (isSpecial(form)) {
+      ret = RT.list(QUOTE, form);
+    } else if (form instanceof Symbol) {
+      Symbol sym = (Symbol) form;
+      if (sym.getNamespace() == null && sym.getName().endsWith("#")) {
+        // auto-gensym: foo# -> foo__N__auto__, stable within this syntax-quote
+        if (gensymEnv == null) throw new IllegalStateException("Gensym literal not in syntax-quote");
+        Symbol gs = gensymEnv.get(sym);
+        if (gs == null) {
+          gs = Symbol.intern(null, sym.getName().substring(0, sym.getName().length() - 1)
+              + "__" + RT.nextID() + "__auto__");
+          gensymEnv.put(sym, gs);
+        }
+        sym = gs;
+      } else if (sym.getNamespace() == null && sym.getName().endsWith(".")) {
+        Symbol csym = Symbol.intern(null, sym.getName().substring(0, sym.getName().length() - 1));
+        csym = resolveSymbol(csym);
+        sym = Symbol.intern(null, csym.getName().concat("."));
+      } else if (sym.getNamespace() == null && sym.getName().startsWith(".")) {
+        // instance method name: leave as-is (quoted below)
+      } else {
+        Object maybeClass = null;
+        if (sym.getNamespace() != null)
+          maybeClass = currentNS().getMapping(Symbol.intern(null, sym.getNamespace()));
+        if (maybeClass instanceof Class)
+          sym = Symbol.intern(((Class) maybeClass).getName(), sym.getName());
+        else
+          sym = resolveSymbol(sym);
+      }
+      ret = RT.list(QUOTE, sym);
+    } else if (isUnquote(form)) {
+      return RT.second(form);
+    } else if (isUnquoteSplicing(form)) {
+      throw new IllegalStateException("splice not in list");
+    } else if (form instanceof IPersistentCollection) {
+      if (form instanceof IRecord) {
+        ret = form;
+      } else if (form instanceof IPersistentMap) {
+        IPersistentVector keyvals = flattenMap(form);
+        ret = RT.list(APPLY, HASHMAP, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(keyvals.seq()))));
+      } else if (form instanceof IPersistentVector) {
+        ret = RT.list(APPLY, VECTOR, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(((IPersistentVector) form).seq()))));
+      } else if (form instanceof IPersistentSet) {
+        ret = RT.list(APPLY, HASHSET, RT.list(SEQ, RT.cons(CONCAT, sqExpandList(((IPersistentSet) form).seq()))));
+      } else if (form instanceof ISeq || form instanceof IPersistentList) {
+        ISeq seq = RT.seq(form);
+        if (seq == null) ret = RT.cons(LIST, null);
+        else ret = RT.list(SEQ, RT.cons(CONCAT, sqExpandList(seq)));
+      } else {
+        throw new UnsupportedOperationException("Unknown Collection type");
+      }
+    } else if (form instanceof Keyword || form instanceof Number
+        || form instanceof Character || form instanceof String) {
+      ret = form;
+    } else {
+      ret = RT.list(QUOTE, form);
+    }
+
+    if (form instanceof IObj && RT.meta(form) != null) {
+      IPersistentMap newMeta = ((IObj) form).meta().without(LINE_KEY).without(COLUMN_KEY);
+      if (newMeta.count() > 0)
+        return RT.list(WITH_META, ret, syntaxQuote(((IObj) form).meta()));
+    }
+    return ret;
+  }
+
+  private ISeq sqExpandList(ISeq seq) {
+    PersistentVector ret = PersistentVector.EMPTY;
+    for (; seq != null; seq = seq.next()) {
+      Object item = seq.first();
+      if (isUnquote(item)) ret = ret.cons(RT.list(LIST, RT.second(item)));
+      else if (isUnquoteSplicing(item)) ret = ret.cons(RT.second(item));
+      else ret = ret.cons(RT.list(LIST, syntaxQuote(item)));
+    }
+    return ret.seq();
+  }
+
+  private static IPersistentVector flattenMap(Object form) {
+    IPersistentVector keyvals = PersistentVector.EMPTY;
+    for (ISeq s = RT.seq(form); s != null; s = s.next()) {
+      IMapEntry e = (IMapEntry) s.first();
+      keyvals = (IPersistentVector) keyvals.cons(e.key());
+      keyvals = (IPersistentVector) keyvals.cons(e.val());
+    }
+    return keyvals;
+  }
+
+  private static boolean isUnquote(Object form) {
+    return form instanceof ISeq && UNQUOTE.equals(RT.first(form));
+  }
+
+  private static boolean isUnquoteSplicing(Object form) {
+    return form instanceof ISeq && UNQUOTE_SPLICING.equals(RT.first(form));
+  }
+
   // Handles a form beginning with '#'. The leading '#' has NOT been consumed. Returns the
   // form, or SKIP for a no-value dispatch (#_, #!).
   private Object readDispatch() throws IOException {
@@ -193,6 +451,7 @@ public class Reader2 {
     if (ch == -1) throw new RuntimeException("EOF while reading character");
     switch (ch) {
       case '{': buffer.read(); return readSet();
+      case '(': buffer.read(); return readFn();                          // #(...) anonymous fn
       case '_': {                           // discard the next form
         buffer.read();
         Object discarded = read0(0);
@@ -258,6 +517,13 @@ public class Reader2 {
     Object form = readForm();
     IFn reader = dataReaderFor((Symbol) tag);
     if (reader != null) return reader.invoke(form);
+    // No registered reader. Clojure routes tags whose *name* contains '.' to record
+    // construction (unsupported here); only plain tags fall back to *default-data-reader-fn*,
+    // called as (f tag form). Guarding on the dot keeps dotted tags from wrongly hitting it.
+    if (!((Symbol) tag).getName().contains(".")) {
+      IFn defaultReader = (IFn) RT.var("clojure.core", "*default-data-reader-fn*").deref();
+      if (defaultReader != null) return defaultReader.invoke(tag, form);
+    }
     throw new RuntimeException("No reader function for tag " + tag);
   }
 
